@@ -1,0 +1,18 @@
+name: example
+discord_token_env: DISCORD_BOT_TOKEN
+codex:
+  command: codex
+  args:
+    - app-server
+    - --stdio
+  cwd: /path/to/project
+  model: gpt-5.5
+  sandbox: workspace-write
+  approval_policy: on-request
+access:
+  allow_user_ids: []
+  channels: []
+runtime:
+  data_dir: ~/.local/share/codex-discord-bot/example
+  log_level: info
+
