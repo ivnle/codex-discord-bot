@@ -12,6 +12,7 @@ import {
 
 import type { ApprovalChoice } from "../approvals/approval-bridge.js";
 import type {
+  DiscordAttachment,
   DiscordApprovalChoiceHandler,
   DiscordGateway,
   DiscordMessage,
@@ -33,13 +34,28 @@ export interface DiscordMessageLike {
   };
   channelId: string;
   content: string;
+  attachments: {
+    values(): Iterable<DiscordAttachmentLike>;
+  };
   inGuild(): boolean;
+}
+
+interface DiscordAttachmentLike {
+  url: string;
+  contentType?: string | null;
 }
 
 export function toGatewayMessage(
   message: DiscordMessageLike
 ): DiscordMessage | undefined {
-  if (message.author.bot || message.content.trim().length === 0) {
+  const attachments = Array.from(
+    message.attachments.values(),
+    toGatewayAttachment
+  );
+  if (
+    message.author.bot ||
+    (message.content.trim().length === 0 && attachments.length === 0)
+  ) {
     return undefined;
   }
 
@@ -48,7 +64,17 @@ export function toGatewayMessage(
     authorId: message.author.id,
     channelId: message.channelId,
     content: message.content,
+    attachments,
     isDirectMessage: !message.inGuild()
+  };
+}
+
+function toGatewayAttachment(
+  attachment: DiscordAttachmentLike
+): DiscordAttachment {
+  return {
+    url: attachment.url,
+    contentType: attachment.contentType
   };
 }
 

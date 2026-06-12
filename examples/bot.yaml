@@ -16,3 +16,7 @@ runtime:
   data_dir: ~/.local/share/codex-discord-bot/example
   log_level: info
 
+# Optional voice/audio attachment transcription. Disabled by default.
+transcription:
+  enabled: false
+  binary: transcribe

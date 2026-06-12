@@ -49,9 +49,29 @@ describe("loadConfigFromString", () => {
       },
       runtime: {
         logLevel: "info"
+      },
+      transcription: {
+        enabled: false,
+        binary: "transcribe"
       }
     });
     expect(config.runtime.dataDir).toMatch(/codex-discord-bot\/example$/);
+  });
+
+  it("parses opt-in transcription config", () => {
+    const config = loadConfigFromString(
+      `${VALID_CONFIG}
+transcription:
+  enabled: true
+  binary: custom-transcribe
+`,
+      "/configs/example.yaml"
+    );
+
+    expect(config.transcription).toEqual({
+      enabled: true,
+      binary: "custom-transcribe"
+    });
   });
 
   it("rejects missing required fields and malformed access entries", () => {
@@ -67,6 +87,29 @@ access:
   channels: []
 runtime:
   data_dir: /tmp/data
+`,
+        "/configs/bad.yaml"
+      )
+    ).toThrow(ConfigValidationError);
+  });
+
+  it("rejects enabled transcription without a binary", () => {
+    expect(() =>
+      loadConfigFromString(
+        `${VALID_CONFIG}
+transcription:
+  enabled: true
+`,
+        "/configs/bad.yaml"
+      )
+    ).toThrow(ConfigValidationError);
+
+    expect(() =>
+      loadConfigFromString(
+        `${VALID_CONFIG}
+transcription:
+  enabled: true
+  binary: ""
 `,
         "/configs/bad.yaml"
       )

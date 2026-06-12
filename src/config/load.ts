@@ -59,6 +59,11 @@ export function loadConfigFromString(
   const cwd = requiredString(codexRaw?.cwd, "codex.cwd", issues);
   const accessRaw = getOptionalRecord(raw.access, "access", issues);
   const runtimeRaw = getOptionalRecord(raw.runtime, "runtime", issues);
+  const transcriptionRaw = getOptionalRecord(
+    raw.transcription,
+    "transcription",
+    issues
+  );
 
   const command = optionalString(codexRaw?.command, "codex.command", issues);
   const args = optionalStringArray(codexRaw?.args, "codex.args", issues);
@@ -96,6 +101,23 @@ export function loadConfigFromString(
     LOG_LEVELS,
     issues
   );
+  const transcriptionEnabled = optionalBoolean(
+    transcriptionRaw?.enabled,
+    "transcription.enabled",
+    issues
+  );
+  const transcriptionBinary =
+    transcriptionEnabled === true
+      ? requiredString(
+          transcriptionRaw?.binary,
+          "transcription.binary",
+          issues
+        )
+      : optionalString(
+          transcriptionRaw?.binary,
+          "transcription.binary",
+          issues
+        );
 
   if (issues.length > 0) {
     throw new ConfigValidationError(
@@ -125,6 +147,10 @@ export function loadConfigFromString(
         path.dirname(configPath)
       ),
       logLevel: (logLevel ?? "info") as BotConfig["runtime"]["logLevel"]
+    },
+    transcription: {
+      enabled: transcriptionEnabled ?? false,
+      binary: transcriptionBinary ?? "transcribe"
     }
   };
 }
@@ -206,6 +232,21 @@ function optionalString(
     return value;
   }
   issues.push(`${field} must be a non-empty string`);
+  return undefined;
+}
+
+function optionalBoolean(
+  value: unknown,
+  field: string,
+  issues: string[]
+): boolean | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value === "boolean") {
+    return value;
+  }
+  issues.push(`${field} must be a boolean`);
   return undefined;
 }
 

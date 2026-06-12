@@ -18,12 +18,14 @@ import type { BotConfig } from "../../src/config/types.js";
 import type {
   DiscordApprovalChoice,
   DiscordApprovalChoiceHandler,
+  DiscordAttachment,
   DiscordGateway,
   DiscordMessage,
   DiscordMessageHandler,
   DiscordPrompt
 } from "../../src/discord/gateway.js";
 import { ThreadStateStore } from "../../src/state/thread-state.js";
+import type { Transcriber } from "../../src/transcription/transcriber.js";
 import { FakeAppServerTransport } from "../fakes/fake-app-server-transport.js";
 
 const createdDirs: string[] = [];
@@ -189,6 +191,134 @@ describe("CodexDiscordBot", () => {
     ]);
   });
 
+  it("starts a Codex turn with transcript text for an audio-only voice note", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    const transcriber = new FakeTranscriber({
+      "https://cdn.example.test/voice.ogg": "hello world"
+    });
+    await new CodexDiscordBot(
+      configFor(dataDir, { transcription: enabledTranscription() }),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir),
+      transcriber
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(
+      message("message-1", "", [
+        attachment("https://cdn.example.test/voice.ogg", "audio/ogg")
+      ])
+    );
+
+    expect(transcriber.calls).toEqual(["https://cdn.example.test/voice.ogg"]);
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual([
+      "hello world"
+    ]);
+  });
+
+  it("combines typed text and audio transcript", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    const transcriber = new FakeTranscriber({
+      "https://cdn.example.test/voice.ogg": "transcribed voice"
+    });
+    await new CodexDiscordBot(
+      configFor(dataDir, { transcription: enabledTranscription() }),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir),
+      transcriber
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(
+      message("message-1", "typed text", [
+        attachment("https://cdn.example.test/voice.ogg", "audio/ogg")
+      ])
+    );
+
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual([
+      "typed text\ntranscribed voice"
+    ]);
+  });
+
+  it("drops a voice-only message when transcription fails", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    const transcriber = new FakeTranscriber({
+      "https://cdn.example.test/voice.ogg": null
+    });
+    await new CodexDiscordBot(
+      configFor(dataDir, { transcription: enabledTranscription() }),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir),
+      transcriber
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(
+      message("message-1", "", [
+        attachment("https://cdn.example.test/voice.ogg", "audio/ogg")
+      ])
+    );
+
+    expect(transcriber.calls).toEqual(["https://cdn.example.test/voice.ogg"]);
+    expect(codex.turns).toEqual([]);
+  });
+
+  it("ignores non-audio attachments and treats the message as plain text", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    const transcriber = new FakeTranscriber({});
+    await new CodexDiscordBot(
+      configFor(dataDir, { transcription: enabledTranscription() }),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir),
+      transcriber
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(
+      message("message-1", "look at this", [
+        attachment("https://cdn.example.test/image.png", "image/png")
+      ])
+    );
+
+    expect(transcriber.calls).toEqual([]);
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual([
+      "look at this"
+    ]);
+  });
+
+  it("ignores audio attachments when transcription is disabled", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    const transcriber = new FakeTranscriber({
+      "https://cdn.example.test/voice.ogg": "ignored transcript"
+    });
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir),
+      transcriber
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(
+      message("message-1", "", [
+        attachment("https://cdn.example.test/voice.ogg", "audio/ogg")
+      ])
+    );
+
+    expect(transcriber.calls).toEqual([]);
+    expect(codex.turns).toEqual([]);
+  });
+
   it("queues allowed messages FIFO while a Codex turn is active", async () => {
     const dataDir = await tempDataDir();
     const discord = new FakeDiscordGateway();
@@ -303,7 +433,10 @@ describe("CodexDiscordBot", () => {
   });
 });
 
-function configFor(dataDir: string): BotConfig {
+function configFor(
+  dataDir: string,
+  options: { transcription?: BotConfig["transcription"] } = {}
+): BotConfig {
   return {
     name: "example",
     discordTokenEnv: "DISCORD_BOT_TOKEN",
@@ -322,17 +455,40 @@ function configFor(dataDir: string): BotConfig {
     runtime: {
       dataDir,
       logLevel: "info"
+    },
+    transcription: options.transcription ?? {
+      enabled: false,
+      binary: "transcribe"
     }
   };
 }
 
-function message(id: string, content: string): DiscordMessage {
+function enabledTranscription(): BotConfig["transcription"] {
+  return {
+    enabled: true,
+    binary: "fake-transcribe"
+  };
+}
+
+function attachment(url: string, contentType: string): DiscordAttachment {
+  return {
+    url,
+    contentType
+  };
+}
+
+function message(
+  id: string,
+  content: string,
+  attachments: DiscordAttachment[] = []
+): DiscordMessage {
   return {
     id,
     authorId: "user-1",
     channelId: "channel-1",
     isDirectMessage: false,
-    content
+    content,
+    attachments
   };
 }
 
@@ -417,6 +573,17 @@ class FakeDiscordGateway implements DiscordGateway {
     for (const handler of this.approvalHandlers) {
       await handler(choice);
     }
+  }
+}
+
+class FakeTranscriber implements Transcriber {
+  readonly calls: string[] = [];
+
+  constructor(private readonly transcriptsByUrl: Record<string, string | null>) {}
+
+  async transcribe(audioUrl: string): Promise<string | null> {
+    this.calls.push(audioUrl);
+    return this.transcriptsByUrl[audioUrl] ?? null;
   }
 }
 

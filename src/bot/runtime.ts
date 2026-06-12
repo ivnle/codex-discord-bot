@@ -9,11 +9,13 @@ import type { CodexClient, CodexThreadOptions } from "../codex/client.js";
 import type { BotConfig } from "../config/types.js";
 import type {
   DiscordApprovalChoice,
+  DiscordAttachment,
   DiscordGateway,
   DiscordMessage
 } from "../discord/gateway.js";
 import { chunkReply } from "../replies/chunk.js";
 import type { ThreadStateStore } from "../state/thread-state.js";
+import { CliTranscriber, type Transcriber } from "../transcription/transcriber.js";
 
 interface QueuedMessage {
   message: DiscordMessage;
@@ -30,7 +32,10 @@ export class CodexDiscordBot {
     private readonly config: BotConfig,
     private readonly discord: DiscordGateway,
     private readonly codex: CodexClient,
-    private readonly state: ThreadStateStore
+    private readonly state: ThreadStateStore,
+    private readonly transcriber: Transcriber = new CliTranscriber(
+      config.transcription.binary
+    )
   ) {}
 
   async start(discordToken: string): Promise<void> {
@@ -80,12 +85,45 @@ export class CodexDiscordBot {
       return;
     }
 
-    if (this.activeTurn) {
-      this.queue.push({ message });
+    const turnMessage = await this.messageWithTranscripts(message);
+    if (turnMessage.content.trim().length === 0) {
       return;
     }
 
-    await this.startTurn(message);
+    if (this.activeTurn) {
+      this.queue.push({ message: turnMessage });
+      return;
+    }
+
+    await this.startTurn(turnMessage);
+  }
+
+  private async messageWithTranscripts(
+    message: DiscordMessage
+  ): Promise<DiscordMessage> {
+    if (!this.config.transcription.enabled) {
+      return message;
+    }
+
+    const audioAttachments = message.attachments.filter(isAudioAttachment);
+    if (audioAttachments.length === 0) {
+      return message;
+    }
+
+    const transcripts: string[] = [];
+    for (const attachment of audioAttachments) {
+      const transcript = await this.transcriber.transcribe(attachment.url);
+      if (transcript && transcript.trim().length > 0) {
+        transcripts.push(transcript);
+      }
+    }
+
+    return {
+      ...message,
+      content: [message.content, ...transcripts]
+        .filter((part) => part.trim().length > 0)
+        .join("\n")
+    };
   }
 
   private async startTurn(message: DiscordMessage): Promise<void> {
@@ -190,6 +228,10 @@ export class CodexDiscordBot {
         : {})
     };
   }
+}
+
+function isAudioAttachment(attachment: DiscordAttachment): boolean {
+  return attachment.contentType?.startsWith("audio/") ?? false;
 }
 
 function isUnresumableThreadError(error: unknown): boolean {

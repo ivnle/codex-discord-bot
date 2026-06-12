@@ -26,6 +26,23 @@ or resumes one Codex thread, accepts messages only from allowlisted users and
 opted-in channels, queues turns FIFO, and posts final assistant replies back to
 Discord.
 
+### Voice transcription
+
+Voice notes and audio attachments are ignored by default. To opt in, enable the
+`transcription` block in the YAML config and provide a `transcribe`-compatible
+CLI on `PATH`:
+
+```yaml
+transcription:
+  enabled: true
+  binary: transcribe
+```
+
+The bot invokes the CLI as `transcribe <audio-file> --json` and uses the
+returned JSON object's `final` field as plain text input for Codex. Failed
+transcriptions are skipped; a voice-only message with no successful transcript is
+treated like an empty message.
+
 ## Goal
 
 Provide a standalone bot that:

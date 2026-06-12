@@ -6,6 +6,12 @@ export interface DiscordMessage {
   channelId: string;
   isDirectMessage: boolean;
   content: string;
+  attachments: DiscordAttachment[];
+}
+
+export interface DiscordAttachment {
+  url: string;
+  contentType?: string | null;
 }
 
 export interface DiscordPrompt {

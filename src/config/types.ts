@@ -24,4 +24,8 @@ export interface BotConfig {
     dataDir: string;
     logLevel: "debug" | "info" | "warn" | "error";
   };
+  transcription: {
+    enabled: boolean;
+    binary: string;
+  };
 }
