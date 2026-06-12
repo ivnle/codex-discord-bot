@@ -1,14 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { AppServerCodexClient } from "../../src/codex/app-server-client.js";
-import type {
-  JsonRpcMessage,
-  JsonRpcTransport
-} from "../../src/codex/json-rpc.js";
+import { FakeAppServerTransport } from "../fakes/fake-app-server-transport.js";
 
 describe("AppServerCodexClient", () => {
   it("initializes app-server, starts/resumes threads, and starts turns", async () => {
-    const transport = new FakeJsonRpcTransport();
+    const transport = new FakeAppServerTransport();
     const client = new AppServerCodexClient(transport);
 
     await client.connect();
@@ -80,39 +77,32 @@ describe("AppServerCodexClient", () => {
     ]);
   });
 
-  it("emits final assistant text from turn/completed notifications", async () => {
-    const transport = new FakeJsonRpcTransport();
+  it("emits final assistant text from final_answer item/completed notifications only", async () => {
+    const transport = new FakeAppServerTransport();
     const client = new AppServerCodexClient(transport);
     const finals: Array<{ threadId: string; text: string }> = [];
+    const completedTurns: Array<{ threadId: string }> = [];
     client.onFinalMessage((message) => {
       finals.push(message);
     });
+    client.onTurnCompleted((message) => {
+      completedTurns.push(message);
+    });
     await client.connect();
 
-    transport.emit({
-      method: "turn/completed",
-      params: {
-        threadId: "thread-1",
-        turn: {
-          items: [
-            { type: "userMessage", id: "user-1", clientId: null, content: [] },
-            {
-              type: "agentMessage",
-              id: "agent-1",
-              text: "final answer",
-              phase: null,
-              memoryCitation: null
-            }
-          ]
-        }
-      }
+    transport.emitCompletedTurn({
+      threadId: "thread-1",
+      turnId: "turn-1",
+      commentaryText: "commentary should not be posted",
+      finalText: "final answer"
     });
 
     expect(finals).toEqual([{ threadId: "thread-1", text: "final answer" }]);
+    expect(completedTurns).toEqual([{ threadId: "thread-1" }]);
   });
 
   it("forwards approval requests and writes app-server responses", async () => {
-    const transport = new FakeJsonRpcTransport();
+    const transport = new FakeAppServerTransport();
     const client = new AppServerCodexClient(transport);
     const approvals: Record<string, unknown>[] = [];
     client.onApprovalRequest((request) => {
@@ -152,55 +142,3 @@ describe("AppServerCodexClient", () => {
     });
   });
 });
-
-class FakeJsonRpcTransport implements JsonRpcTransport {
-  started = false;
-  sent: JsonRpcMessage[] = [];
-  private handler: ((message: JsonRpcMessage) => void) | undefined;
-
-  onMessage(handler: (message: JsonRpcMessage) => void): void {
-    this.handler = handler;
-  }
-
-  async start(): Promise<void> {
-    this.started = true;
-  }
-
-  async stop(): Promise<void> {}
-
-  async send(message: JsonRpcMessage): Promise<void> {
-    this.sent.push(message);
-    if ("id" in message && "method" in message) {
-      queueMicrotask(() => this.respondTo(message));
-    }
-  }
-
-  emit(message: JsonRpcMessage): void {
-    this.handler?.(message);
-  }
-
-  sentRequests(): JsonRpcMessage[] {
-    return this.sent.filter((message) => "method" in message);
-  }
-
-  private respondTo(message: JsonRpcMessage): void {
-    if (!("method" in message)) {
-      return;
-    }
-    if (message.method === "thread/start") {
-      this.emit({
-        id: message.id,
-        result: { thread: { id: "thread-1" } }
-      });
-      return;
-    }
-    if (message.method === "thread/resume") {
-      this.emit({
-        id: message.id,
-        result: { thread: { id: "stored-thread" } }
-      });
-      return;
-    }
-    this.emit({ id: message.id, result: {} });
-  }
-}

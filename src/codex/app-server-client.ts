@@ -4,7 +4,8 @@ import type {
   CodexFinalMessageHandler,
   CodexRpcId,
   CodexStartTurnRequest,
-  CodexThreadOptions
+  CodexThreadOptions,
+  CodexTurnCompletedHandler
 } from "./client.js";
 import { JsonRpcPeer, type JsonRpcMessage, type JsonRpcTransport } from "./json-rpc.js";
 
@@ -19,6 +20,7 @@ const APPROVAL_REQUEST_METHODS = new Set([
 export class AppServerCodexClient implements CodexClient {
   private readonly peer: JsonRpcPeer;
   private readonly finalHandlers: CodexFinalMessageHandler[] = [];
+  private readonly turnCompletedHandlers: CodexTurnCompletedHandler[] = [];
   private readonly approvalHandlers: CodexApprovalRequestHandler[] = [];
 
   constructor(transport: JsonRpcTransport) {
@@ -76,6 +78,10 @@ export class AppServerCodexClient implements CodexClient {
     this.finalHandlers.push(handler);
   }
 
+  onTurnCompleted(handler: CodexTurnCompletedHandler): void {
+    this.turnCompletedHandlers.push(handler);
+  }
+
   onApprovalRequest(handler: CodexApprovalRequestHandler): void {
     this.approvalHandlers.push(handler);
   }
@@ -88,24 +94,34 @@ export class AppServerCodexClient implements CodexClient {
   }
 
   private handleNotification(message: JsonRpcMessage): void {
-    if (message.method !== "turn/completed") {
-      return;
-    }
     const params = asRecord(message.params);
     const threadId = typeof params.threadId === "string" ? params.threadId : "";
-    const turn = asRecord(params.turn);
-    const items = Array.isArray(turn.items) ? turn.items : [];
-    const finalAgentMessage = [...items]
-      .reverse()
-      .map((item) => asRecord(item))
-      .find((item) => item.type === "agentMessage" && typeof item.text === "string");
 
-    if (!threadId || !finalAgentMessage) {
+    if (!threadId) {
       return;
     }
 
-    for (const handler of this.finalHandlers) {
-      void handler({ threadId, text: finalAgentMessage.text as string });
+    if (message.method === "item/completed") {
+      const item = asRecord(params.item);
+      if (
+        item.type !== "agentMessage" ||
+        item.phase !== "final_answer" ||
+        typeof item.text !== "string" ||
+        item.text.length === 0
+      ) {
+        return;
+      }
+
+      for (const handler of this.finalHandlers) {
+        void handler({ threadId, text: item.text });
+      }
+      return;
+    }
+
+    if (message.method === "turn/completed") {
+      for (const handler of this.turnCompletedHandlers) {
+        void handler({ threadId });
+      }
     }
   }
 

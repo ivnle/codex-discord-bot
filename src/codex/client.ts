@@ -31,6 +31,14 @@ export type CodexFinalMessageHandler = (
   message: CodexFinalMessage
 ) => void | Promise<void>;
 
+export interface CodexTurnCompleted {
+  threadId: string;
+}
+
+export type CodexTurnCompletedHandler = (
+  message: CodexTurnCompleted
+) => void | Promise<void>;
+
 export type CodexApprovalRequestHandler = (
   request: Record<string, unknown>
 ) => void | Promise<void>;
@@ -43,6 +51,7 @@ export interface CodexClient {
   resumeThread(threadId: string, options?: CodexThreadOptions): Promise<string>;
   startTurn(request: CodexStartTurnRequest): Promise<void>;
   onFinalMessage(handler: CodexFinalMessageHandler): void;
+  onTurnCompleted(handler: CodexTurnCompletedHandler): void;
   onApprovalRequest(handler: CodexApprovalRequestHandler): void;
   sendApprovalResponse(
     rpcId: CodexRpcId,

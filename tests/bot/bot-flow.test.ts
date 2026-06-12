@@ -5,12 +5,14 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { CodexDiscordBot } from "../../src/bot/runtime.js";
+import { AppServerCodexClient } from "../../src/codex/app-server-client.js";
 import type {
   CodexApprovalRequestHandler,
   CodexClient,
   CodexFinalMessageHandler,
   CodexStartTurnRequest,
-  CodexThreadOptions
+  CodexThreadOptions,
+  CodexTurnCompletedHandler
 } from "../../src/codex/client.js";
 import type { BotConfig } from "../../src/config/types.js";
 import type {
@@ -22,6 +24,7 @@ import type {
   DiscordPrompt
 } from "../../src/discord/gateway.js";
 import { ThreadStateStore } from "../../src/state/thread-state.js";
+import { FakeAppServerTransport } from "../fakes/fake-app-server-transport.js";
 
 const createdDirs: string[] = [];
 
@@ -77,10 +80,81 @@ describe("CodexDiscordBot", () => {
     expect(codex.startedThreads).toEqual([]);
   });
 
+  it("starts and persists a new thread when a stored thread cannot be resumed", async () => {
+    const dataDir = await tempDataDir();
+    const state = new ThreadStateStore(dataDir);
+    await state.writeThreadId("stored-thread");
+    const discord = new FakeDiscordGateway();
+    const transport = new FakeAppServerTransport();
+    transport.resumeError = {
+      code: -32600,
+      message: "no rollout found for thread id stored-thread"
+    };
+    transport.nextStartedThreadId = "replacement-thread";
+    const codex = new AppServerCodexClient(transport);
+
+    await expect(
+      new CodexDiscordBot(configFor(dataDir), discord, codex, state).start(
+        "gateway-auth-value"
+      )
+    ).resolves.toBeUndefined();
+
+    expect(transport.sentRequests()).toMatchObject([
+      { method: "initialize" },
+      {
+        method: "thread/resume",
+        params: {
+          threadId: "stored-thread",
+          cwd: "/tmp/project",
+          model: "gpt-5.5",
+          sandbox: "workspace-write",
+          approvalPolicy: "on-request",
+          approvalsReviewer: "user"
+        }
+      },
+      {
+        method: "thread/start",
+        params: {
+          cwd: "/tmp/project",
+          model: "gpt-5.5",
+          sandbox: "workspace-write",
+          approvalPolicy: "on-request",
+          approvalsReviewer: "user",
+          sessionStartSource: "startup"
+        }
+      }
+    ]);
+    await expect(state.readThreadId()).resolves.toBe("replacement-thread");
+    expect(discord.startedToken).toBe("gateway-auth-value");
+  });
+
+  it("does not replace a stored thread for unrelated resume failures", async () => {
+    const dataDir = await tempDataDir();
+    const state = new ThreadStateStore(dataDir);
+    await state.writeThreadId("stored-thread");
+    const discord = new FakeDiscordGateway();
+    const transport = new FakeAppServerTransport();
+    transport.resumeError = new Error("transport unavailable");
+    const codex = new AppServerCodexClient(transport);
+
+    await expect(
+      new CodexDiscordBot(configFor(dataDir), discord, codex, state).start(
+        "gateway-auth-value"
+      )
+    ).rejects.toThrow("transport unavailable");
+
+    expect(
+      transport.sentRequests().some((request) => request.method === "thread/start")
+    ).toBe(false);
+    await expect(state.readThreadId()).resolves.toBe("stored-thread");
+    expect(discord.startedToken).toBeUndefined();
+  });
+
   it("sends allowed Discord messages to turn/start and posts the final reply", async () => {
     const dataDir = await tempDataDir();
     const discord = new FakeDiscordGateway();
-    const codex = new FakeCodexClient();
+    const transport = new FakeAppServerTransport();
+    const codex = new AppServerCodexClient(transport);
     await new CodexDiscordBot(
       configFor(dataDir),
       discord,
@@ -90,20 +164,24 @@ describe("CodexDiscordBot", () => {
 
     await discord.emitMessage(message("message-1", "hello Codex"));
 
-    expect(codex.turns).toEqual([
-      {
+    expect(transport.sentRequests().at(-1)).toMatchObject({
+      method: "turn/start",
+      params: {
         threadId: "thread-1",
         clientUserMessageId: "message-1",
         input: [{ type: "text", text: "hello Codex", text_elements: [] }],
         cwd: "/tmp/project",
         model: "gpt-5.5",
-        approvalPolicy: "on-request"
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user"
       }
-    ]);
+    });
 
-    await codex.emitFinalMessage({
+    transport.emitCompletedTurn({
       threadId: "thread-1",
-      text: "final answer"
+      turnId: "turn-1",
+      commentaryText: "commentary should not be posted",
+      finalText: "final answer"
     });
 
     expect(discord.sentMessages).toEqual([
@@ -132,6 +210,10 @@ describe("CodexDiscordBot", () => {
     expect(discord.sentMessages).toEqual([
       { channelId: "channel-1", content: "done first" }
     ]);
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual(["first"]);
+
+    await codex.emitTurnCompleted({ threadId: "thread-1" });
+
     expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual([
       "first",
       "second"
@@ -141,6 +223,43 @@ describe("CodexDiscordBot", () => {
 
     expect(discord.sentMessages).toEqual([
       { channelId: "channel-1", content: "done first" },
+      { channelId: "channel-1", content: "done second" }
+    ]);
+  });
+
+  it("does not post a reply for tool-only turns but still drains the queue", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const transport = new FakeAppServerTransport();
+    const codex = new AppServerCodexClient(transport);
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "run a tool"));
+    await discord.emitMessage(message("message-2", "after tool"));
+
+    expect(turnStartTexts(transport)).toEqual(["run a tool"]);
+
+    transport.emitCompletedTurn({
+      threadId: "thread-1",
+      turnId: "turn-1",
+      commentaryText: "tool commentary should not be posted"
+    });
+
+    expect(discord.sentMessages).toEqual([]);
+    expect(turnStartTexts(transport)).toEqual(["run a tool", "after tool"]);
+
+    transport.emitCompletedTurn({
+      threadId: "thread-1",
+      turnId: "turn-2",
+      finalText: "done second"
+    });
+
+    expect(discord.sentMessages).toEqual([
       { channelId: "channel-1", content: "done second" }
     ]);
   });
@@ -233,6 +352,24 @@ function commandApprovalRequest(id: string): Record<string, unknown> {
   };
 }
 
+function turnStartTexts(transport: FakeAppServerTransport): string[] {
+  return transport
+    .sentRequests()
+    .filter((request) => request.method === "turn/start")
+    .map((request) => {
+      const params = asRecord(request.params);
+      const input = Array.isArray(params.input) ? params.input : [];
+      const firstInput = asRecord(input[0]);
+      return typeof firstInput.text === "string" ? firstInput.text : "";
+    });
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
 class FakeDiscordGateway implements DiscordGateway {
   startedToken: string | undefined;
   sentMessages: Array<{ channelId: string; content: string }> = [];
@@ -291,6 +428,7 @@ class FakeCodexClient implements CodexClient {
   approvalResponses: Array<{ rpcId: string; response: Record<string, unknown> }> =
     [];
   private readonly finalHandlers: CodexFinalMessageHandler[] = [];
+  private readonly turnCompletedHandlers: CodexTurnCompletedHandler[] = [];
   private readonly approvalHandlers: CodexApprovalRequestHandler[] = [];
 
   async connect(): Promise<void> {
@@ -315,6 +453,10 @@ class FakeCodexClient implements CodexClient {
     this.finalHandlers.push(handler);
   }
 
+  onTurnCompleted(handler: CodexTurnCompletedHandler): void {
+    this.turnCompletedHandlers.push(handler);
+  }
+
   onApprovalRequest(handler: CodexApprovalRequestHandler): void {
     this.approvalHandlers.push(handler);
   }
@@ -331,6 +473,12 @@ class FakeCodexClient implements CodexClient {
     text: string;
   }): Promise<void> {
     for (const handler of this.finalHandlers) {
+      await handler(messageToEmit);
+    }
+  }
+
+  async emitTurnCompleted(messageToEmit: { threadId: string }): Promise<void> {
+    for (const handler of this.turnCompletedHandlers) {
       await handler(messageToEmit);
     }
   }

@@ -37,6 +37,7 @@ export class CodexDiscordBot {
     this.discord.onMessage((message) => this.handleMessage(message));
     this.discord.onApprovalChoice((choice) => this.handleApprovalChoice(choice));
     this.codex.onFinalMessage((message) => this.handleFinalMessage(message));
+    this.codex.onTurnCompleted((message) => this.handleTurnCompleted(message));
     this.codex.onApprovalRequest((request) =>
       this.handleApprovalRequest(request)
     );
@@ -55,10 +56,18 @@ export class CodexDiscordBot {
   private async initializeThread(): Promise<void> {
     const storedThreadId = await this.state.readThreadId();
     if (storedThreadId) {
-      this.threadId = await this.codex.resumeThread(
-        storedThreadId,
-        this.threadOptions()
-      );
+      try {
+        this.threadId = await this.codex.resumeThread(
+          storedThreadId,
+          this.threadOptions()
+        );
+      } catch (error) {
+        if (!isUnresumableThreadError(error)) {
+          throw error;
+        }
+        this.threadId = await this.codex.startThread(this.threadOptions());
+        await this.state.writeThreadId(this.threadId);
+      }
       return;
     }
 
@@ -110,7 +119,12 @@ export class CodexDiscordBot {
     for (const chunk of chunkReply(message.text)) {
       await this.discord.sendMessage(channelId, chunk);
     }
+  }
 
+  private async handleTurnCompleted(message: { threadId: string }): Promise<void> {
+    if (message.threadId !== this.threadId || !this.activeTurn) {
+      return;
+    }
     this.activeTurn = false;
     this.activeReplyChannelId = undefined;
     await this.startNextQueuedTurn();
@@ -176,4 +190,22 @@ export class CodexDiscordBot {
         : {})
     };
   }
+}
+
+function isUnresumableThreadError(error: unknown): boolean {
+  const errorRecord =
+    typeof error === "object" && error !== null && !Array.isArray(error)
+      ? (error as Record<string, unknown>)
+      : {};
+  const message =
+    typeof errorRecord.message === "string"
+      ? errorRecord.message
+      : error instanceof Error
+        ? error.message
+        : "";
+
+  return (
+    errorRecord.code === -32600 ||
+    message.toLowerCase().includes("no rollout found")
+  );
 }
