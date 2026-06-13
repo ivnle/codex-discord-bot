@@ -592,6 +592,81 @@ describe("CodexDiscordBot", () => {
     expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual(["first"]);
   });
 
+  it("sends app-server interrupt params for stop and clears queued work", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const transport = new FakeAppServerTransport();
+    const codex = new AppServerCodexClient(transport);
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "first"));
+    await discord.emitMessage(message("message-2", "second"));
+    await discord.emitMessage(message("message-3", "!stop"));
+
+    expect(
+      transport
+        .sentRequests()
+        .filter((request) => request.method === "turn/interrupt")
+    ).toMatchObject([
+      {
+        method: "turn/interrupt",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1"
+        }
+      }
+    ]);
+    expect(discord.sentMessages).toEqual([
+      { channelId: "channel-1", content: "Stopped the current turn." }
+    ]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    transport.emitCompletedTurn({ threadId: "thread-1", turnId: "turn-1" });
+
+    expect(turnStartTexts(transport)).toEqual(["first"]);
+  });
+
+  it("keeps the active turn and queue when stop runs before Codex has a turn id", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    codex.interruptResult = false;
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "first"));
+    await discord.emitMessage(message("message-2", "second"));
+    await discord.emitMessage(message("message-3", "!stop"));
+
+    expect(codex.interruptCalls).toBe(1);
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual(["first"]);
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content: "The turn is still starting up - try !stop again in a moment."
+      }
+    ]);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+    await codex.emitTurnCompleted({ threadId: "thread-1" });
+
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual([
+      "first",
+      "second"
+    ]);
+  });
+
   it("reports that nothing is running when stop is requested with no active turn", async () => {
     const dataDir = await tempDataDir();
     const discord = new FakeDiscordGateway();
@@ -1042,6 +1117,7 @@ class FakeCodexClient implements CodexClient {
   resumedThreads: string[] = [];
   turns: CodexStartTurnRequest[] = [];
   interruptCalls = 0;
+  interruptResult = true;
   interruptError: Error | undefined;
   compactedThreadIds: string[] = [];
   compactError: Error | undefined;
@@ -1072,11 +1148,12 @@ class FakeCodexClient implements CodexClient {
     this.turns.push(request);
   }
 
-  async interrupt(): Promise<void> {
+  async interrupt(): Promise<boolean> {
     this.interruptCalls += 1;
     if (this.interruptError) {
       throw this.interruptError;
     }
+    return this.interruptResult;
   }
 
   async compact(threadId: string): Promise<void> {

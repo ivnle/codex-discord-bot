@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { AppServerCodexClient } from "../../src/codex/app-server-client.js";
+import { JsonRpcPeer } from "../../src/codex/json-rpc.js";
 import { FakeAppServerTransport } from "../fakes/fake-app-server-transport.js";
 
 describe("AppServerCodexClient", () => {
@@ -27,7 +28,7 @@ describe("AppServerCodexClient", () => {
       model: "gpt-5.5",
       approvalPolicy: "on-request"
     });
-    await client.interrupt();
+    await expect(client.interrupt()).resolves.toBe(true);
     await client.compact(threadId);
 
     expect(transport.started).toBe(true);
@@ -77,15 +78,100 @@ describe("AppServerCodexClient", () => {
         }
       },
       {
-        method: "turn/interrupt"
+        method: "turn/interrupt",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1"
+        }
       },
       {
-        method: "thread/compact",
+        method: "thread/compact/start",
         params: {
           threadId: "thread-1"
         }
       }
     ]);
+  });
+
+  it("does not send interrupt when no turn id is known", async () => {
+    const transport = new FakeAppServerTransport();
+    const client = new AppServerCodexClient(transport);
+
+    await client.connect();
+    await client.startThread({ cwd: "/tmp/project" });
+
+    await expect(client.interrupt()).resolves.toBe(false);
+    expect(
+      transport
+        .sentRequests()
+        .filter((request) => request.method === "turn/interrupt")
+    ).toEqual([]);
+  });
+
+  it(
+    "tracks turn ids from turn/started notifications and clears them on turn/completed",
+    async () => {
+      const transport = new FakeAppServerTransport();
+      const client = new AppServerCodexClient(transport);
+
+      await client.connect();
+      await client.startThread({ cwd: "/tmp/project" });
+
+      transport.emit({
+        method: "turn/started",
+        params: {
+          threadId: "thread-1",
+          turn: {
+            id: "turn-from-notification",
+            status: "in_progress"
+          }
+        }
+      });
+
+      await expect(client.interrupt()).resolves.toBe(true);
+      expect(transport.sentRequests().at(-1)).toMatchObject({
+        method: "turn/interrupt",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-from-notification"
+        }
+      });
+
+      transport.emit({
+        method: "turn/completed",
+        params: {
+          threadId: "thread-1",
+          turn: {
+            id: "turn-from-notification",
+            status: "completed"
+          }
+        }
+      });
+
+      await expect(client.interrupt()).resolves.toBe(false);
+      expect(
+        transport
+          .sentRequests()
+          .filter((request) => request.method === "turn/interrupt")
+      ).toHaveLength(1);
+    }
+  );
+
+  it("fake transport rejects malformed interrupt params and bare compact methods", async () => {
+    const transport = new FakeAppServerTransport();
+    const peer = new JsonRpcPeer(transport);
+    await peer.start();
+
+    await expect(peer.request("turn/interrupt")).rejects.toMatchObject({
+      code: -32600,
+      message: expect.stringContaining("params")
+    });
+    await expect(
+      peer.request("thread/compact", { threadId: "thread-1" })
+    ).rejects.toMatchObject({
+      code: -32601,
+      message: expect.stringContaining("thread/compact")
+    });
   });
 
   it("emits final assistant text from final_answer item/completed notifications only", async () => {

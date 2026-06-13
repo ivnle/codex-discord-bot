@@ -8,8 +8,10 @@ export class FakeAppServerTransport implements JsonRpcTransport {
   stopped = false;
   sent: JsonRpcMessage[] = [];
   nextStartedThreadId = "thread-1";
+  nextStartedTurnIds = ["turn-1"];
   resumeError: unknown;
   private handler: ((message: JsonRpcMessage) => void) | undefined;
+  private startedTurnCount = 0;
 
   onMessage(handler: (message: JsonRpcMessage) => void): void {
     this.handler = handler;
@@ -115,6 +117,10 @@ export class FakeAppServerTransport implements JsonRpcTransport {
     if (!("method" in message)) {
       return;
     }
+    if (message.method === "initialize") {
+      this.emit({ id: message.id, result: {} });
+      return;
+    }
     if (message.method === "thread/start") {
       this.emit({
         id: message.id,
@@ -139,7 +145,76 @@ export class FakeAppServerTransport implements JsonRpcTransport {
       });
       return;
     }
-    this.emit({ id: message.id, result: {} });
+    if (message.method === "turn/start") {
+      const params = asRecord(message.params);
+      if (typeof params.threadId !== "string" || params.threadId.length === 0) {
+        this.reject(
+          message,
+          -32600,
+          "Invalid request: missing field 'threadId'"
+        );
+        return;
+      }
+      this.emit({
+        id: message.id,
+        result: { turn: { id: this.nextTurnId() } }
+      });
+      return;
+    }
+    if (message.method === "turn/interrupt") {
+      if (!Object.hasOwn(message, "params")) {
+        this.reject(message, -32600, "Invalid request: missing field 'params'");
+        return;
+      }
+      const params = asRecord(message.params);
+      if (typeof params.threadId !== "string" || params.threadId.length === 0) {
+        this.reject(
+          message,
+          -32600,
+          "Invalid request: missing field 'threadId'"
+        );
+        return;
+      }
+      if (typeof params.turnId !== "string" || params.turnId.length === 0) {
+        this.reject(message, -32600, "Invalid request: missing field 'turnId'");
+        return;
+      }
+      this.emit({ id: message.id, result: {} });
+      return;
+    }
+    if (message.method === "thread/compact/start") {
+      const params = asRecord(message.params);
+      if (typeof params.threadId !== "string" || params.threadId.length === 0) {
+        this.reject(
+          message,
+          -32600,
+          "Invalid request: missing field 'threadId'"
+        );
+        return;
+      }
+      this.emit({ id: message.id, result: {} });
+      return;
+    }
+    if (message.method === "thread/compact") {
+      this.reject(message, -32601, "Method not found: thread/compact");
+      return;
+    }
+    this.reject(message, -32601, `Method not found: ${message.method}`);
+  }
+
+  private nextTurnId(): string {
+    this.startedTurnCount += 1;
+    return this.nextStartedTurnIds.shift() ?? `turn-${this.startedTurnCount}`;
+  }
+
+  private reject(message: JsonRpcMessage, code: number, text: string): void {
+    this.emit({
+      id: message.id,
+      error: {
+        code,
+        message: text
+      }
+    });
   }
 }
 

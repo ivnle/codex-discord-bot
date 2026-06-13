@@ -139,7 +139,14 @@ export class CodexDiscordBot {
     }
 
     try {
-      await this.codex.interrupt();
+      const interrupted = await this.codex.interrupt();
+      if (!interrupted) {
+        await this.discord.sendMessage(
+          channelId,
+          "The turn is still starting up - try !stop again in a moment."
+        );
+        return;
+      }
       this.clearActiveTurnState();
       this.clearQueuedMessages();
       this.approvalsById.clear();

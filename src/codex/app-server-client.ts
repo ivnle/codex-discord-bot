@@ -22,6 +22,8 @@ export class AppServerCodexClient implements CodexClient {
   private readonly finalHandlers: CodexFinalMessageHandler[] = [];
   private readonly turnCompletedHandlers: CodexTurnCompletedHandler[] = [];
   private readonly approvalHandlers: CodexApprovalRequestHandler[] = [];
+  private currentThreadId: string | undefined;
+  private currentTurnId: string | undefined;
 
   constructor(transport: JsonRpcTransport) {
     this.peer = new JsonRpcPeer(transport);
@@ -53,7 +55,10 @@ export class AppServerCodexClient implements CodexClient {
       ...threadParams(options),
       sessionStartSource: "startup"
     });
-    return threadIdFromResult(result);
+    const threadId = threadIdFromResult(result);
+    this.currentThreadId = threadId;
+    this.currentTurnId = undefined;
+    return threadId;
   }
 
   async resumeThread(
@@ -64,22 +69,34 @@ export class AppServerCodexClient implements CodexClient {
       threadId,
       ...threadParams(options)
     });
-    return threadIdFromResult(result);
+    const resumedThreadId = threadIdFromResult(result);
+    this.currentThreadId = resumedThreadId;
+    this.currentTurnId = undefined;
+    return resumedThreadId;
   }
 
   async startTurn(request: CodexStartTurnRequest): Promise<void> {
-    await this.peer.request("turn/start", {
+    const result = await this.peer.request("turn/start", {
       ...request,
       approvalsReviewer: "user"
     });
+    this.currentThreadId = request.threadId;
+    this.currentTurnId = turnIdFromResult(result);
   }
 
-  async interrupt(): Promise<void> {
-    await this.peer.request("turn/interrupt");
+  async interrupt(): Promise<boolean> {
+    if (!this.currentThreadId || !this.currentTurnId) {
+      return false;
+    }
+    await this.peer.request("turn/interrupt", {
+      threadId: this.currentThreadId,
+      turnId: this.currentTurnId
+    });
+    return true;
   }
 
   async compact(threadId: string): Promise<void> {
-    await this.peer.request("thread/compact", { threadId });
+    await this.peer.request("thread/compact/start", { threadId });
   }
 
   onFinalMessage(handler: CodexFinalMessageHandler): void {
@@ -109,6 +126,15 @@ export class AppServerCodexClient implements CodexClient {
       return;
     }
 
+    if (message.method === "turn/started") {
+      const turn = asRecord(params.turn);
+      if (typeof turn.id === "string" && turn.id.length > 0) {
+        this.currentThreadId = threadId;
+        this.currentTurnId = turn.id;
+      }
+      return;
+    }
+
     if (message.method === "item/completed") {
       const item = asRecord(params.item);
       if (
@@ -127,6 +153,14 @@ export class AppServerCodexClient implements CodexClient {
     }
 
     if (message.method === "turn/completed") {
+      const turn = asRecord(params.turn);
+      const turnId = typeof turn.id === "string" ? turn.id : undefined;
+      if (
+        threadId === this.currentThreadId &&
+        (!turnId || turnId === this.currentTurnId)
+      ) {
+        this.currentTurnId = undefined;
+      }
       for (const handler of this.turnCompletedHandlers) {
         void handler({ threadId });
       }
@@ -166,6 +200,15 @@ function threadIdFromResult(result: unknown): string {
     throw new Error("Codex app-server response did not include thread.id");
   }
   return thread.id;
+}
+
+function turnIdFromResult(result: unknown): string {
+  const resultRecord = asRecord(result);
+  const turn = asRecord(resultRecord.turn);
+  if (typeof turn.id !== "string" || turn.id.length === 0) {
+    throw new Error("Codex app-server response did not include turn.id");
+  }
+  return turn.id;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
