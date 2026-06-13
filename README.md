@@ -27,6 +27,21 @@ opted-in channels, queues turns FIFO, and posts final assistant replies back to
 Discord. While Codex is working on an active turn, the bot keeps Discord's
 typing indicator visible in the reply channel.
 
+### Discord control commands
+
+Allowed Discord users can send these whole-message commands to control the
+current Codex session locally. Commands are case-insensitive and are not sent to
+Codex as prompts:
+
+- `!stop` or `!cancel`: interrupt the active turn. This clears the active turn,
+  stops typing, and drops queued messages so a stopped backlog does not resume.
+  If no turn is active, the bot replies that nothing is running.
+- `!compact`: compact the current thread. If a turn is active, the bot asks the
+  operator to send `!stop` first so compaction does not race a live turn.
+- `!reset` or `!new`: start a fresh thread, persist its thread id, clear active
+  state, and drop queued messages.
+- `!help`: show the command list.
+
 ### Custom instructions / per-bot prompt
 
 Each bot config can opt into a custom instructions file:

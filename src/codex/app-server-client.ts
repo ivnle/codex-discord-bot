@@ -74,6 +74,14 @@ export class AppServerCodexClient implements CodexClient {
     });
   }
 
+  async interrupt(): Promise<void> {
+    await this.peer.request("turn/interrupt");
+  }
+
+  async compact(threadId: string): Promise<void> {
+    await this.peer.request("thread/compact", { threadId });
+  }
+
   onFinalMessage(handler: CodexFinalMessageHandler): void {
     this.finalHandlers.push(handler);
   }

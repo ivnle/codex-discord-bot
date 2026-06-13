@@ -18,6 +18,10 @@ import type { ThreadStateStore } from "../state/thread-state.js";
 import { CliTranscriber, type Transcriber } from "../transcription/transcriber.js";
 
 const TYPING_REFRESH_MS = 8000;
+const CONTROL_HELP =
+  "Available commands: !stop/!cancel stop the current turn; !compact compact the conversation; !reset/!new start a fresh thread; !help show this help.";
+
+type ControlCommand = "stop" | "compact" | "reset" | "help";
 
 interface QueuedMessage {
   message: DiscordMessage;
@@ -89,6 +93,12 @@ export class CodexDiscordBot {
       return;
     }
 
+    const controlCommand = parseControlCommand(message.content);
+    if (controlCommand) {
+      await this.handleControlCommand(message, controlCommand);
+      return;
+    }
+
     const turnMessage = await this.messageWithTranscripts(message);
     if (turnMessage.content.trim().length === 0) {
       return;
@@ -100,6 +110,97 @@ export class CodexDiscordBot {
     }
 
     await this.startTurn(turnMessage);
+  }
+
+  private async handleControlCommand(
+    message: DiscordMessage,
+    command: ControlCommand
+  ): Promise<void> {
+    switch (command) {
+      case "stop":
+        await this.stopActiveTurn(message.channelId);
+        return;
+      case "compact":
+        await this.compactThread(message.channelId);
+        return;
+      case "reset":
+        await this.resetThread(message.channelId);
+        return;
+      case "help":
+        await this.discord.sendMessage(message.channelId, CONTROL_HELP);
+        return;
+    }
+  }
+
+  private async stopActiveTurn(channelId: string): Promise<void> {
+    if (!this.activeTurn) {
+      await this.discord.sendMessage(channelId, "Nothing is running.");
+      return;
+    }
+
+    try {
+      await this.codex.interrupt();
+      this.clearActiveTurnState();
+      this.clearQueuedMessages();
+      this.approvalsById.clear();
+      await this.discord.sendMessage(channelId, "Stopped the current turn.");
+    } catch (error) {
+      console.error("Failed to stop Codex turn", error);
+      await this.discord.sendMessage(
+        channelId,
+        `Couldn't stop the turn: ${errorMessage(error)}`
+      );
+    }
+  }
+
+  private async compactThread(channelId: string): Promise<void> {
+    if (this.activeTurn) {
+      await this.discord.sendMessage(
+        channelId,
+        "A turn is running. Send !stop before !compact."
+      );
+      return;
+    }
+
+    if (!this.threadId) {
+      await this.discord.sendMessage(
+        channelId,
+        "Couldn't compact the conversation: no Codex thread is initialized"
+      );
+      return;
+    }
+
+    try {
+      await this.codex.compact(this.threadId);
+      await this.discord.sendMessage(channelId, "Compacted the conversation.");
+    } catch (error) {
+      console.error("Failed to compact Codex thread", error);
+      await this.discord.sendMessage(
+        channelId,
+        `Couldn't compact the conversation: ${errorMessage(error)}`
+      );
+    }
+  }
+
+  private async resetThread(channelId: string): Promise<void> {
+    try {
+      const threadId = await this.codex.startThread(this.threadOptions());
+      await this.state.writeThreadId(threadId);
+      this.threadId = threadId;
+      this.clearActiveTurnState();
+      this.clearQueuedMessages();
+      this.approvalsById.clear();
+      await this.discord.sendMessage(
+        channelId,
+        "Started a fresh thread (history cleared)."
+      );
+    } catch (error) {
+      console.error("Failed to reset Codex thread", error);
+      await this.discord.sendMessage(
+        channelId,
+        `Couldn't reset the conversation: ${errorMessage(error)}`
+      );
+    }
   }
 
   private async messageWithTranscripts(
@@ -172,9 +273,7 @@ export class CodexDiscordBot {
     if (message.threadId !== this.threadId || !this.activeTurn) {
       return;
     }
-    this.stopTypingKeepAlive();
-    this.activeTurn = false;
-    this.activeReplyChannelId = undefined;
+    this.clearActiveTurnState();
     await this.startNextQueuedTurn();
   }
 
@@ -253,6 +352,16 @@ export class CodexDiscordBot {
     }
   }
 
+  private clearActiveTurnState(): void {
+    this.stopTypingKeepAlive();
+    this.activeTurn = false;
+    this.activeReplyChannelId = undefined;
+  }
+
+  private clearQueuedMessages(): void {
+    this.queue.splice(0, this.queue.length);
+  }
+
   private threadOptions(): CodexThreadOptions {
     return {
       cwd: this.config.codex.cwd,
@@ -269,6 +378,33 @@ export class CodexDiscordBot {
 
 function isAudioAttachment(attachment: DiscordAttachment): boolean {
   return attachment.contentType?.startsWith("audio/") ?? false;
+}
+
+function parseControlCommand(content: string): ControlCommand | undefined {
+  switch (content.trim().toLowerCase()) {
+    case "!stop":
+    case "!cancel":
+      return "stop";
+    case "!compact":
+      return "compact";
+    case "!reset":
+    case "!new":
+      return "reset";
+    case "!help":
+      return "help";
+    default:
+      return undefined;
+  }
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.length > 0) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.length > 0) {
+    return error;
+  }
+  return "unknown error";
 }
 
 function isUnresumableThreadError(error: unknown): boolean {

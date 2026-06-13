@@ -27,6 +27,8 @@ describe("AppServerCodexClient", () => {
       model: "gpt-5.5",
       approvalPolicy: "on-request"
     });
+    await client.interrupt();
+    await client.compact(threadId);
 
     expect(transport.started).toBe(true);
     expect(transport.sentRequests()).toMatchObject([
@@ -72,6 +74,15 @@ describe("AppServerCodexClient", () => {
           model: "gpt-5.5",
           approvalPolicy: "on-request",
           approvalsReviewer: "user"
+        }
+      },
+      {
+        method: "turn/interrupt"
+      },
+      {
+        method: "thread/compact",
+        params: {
+          threadId: "thread-1"
         }
       }
     ]);

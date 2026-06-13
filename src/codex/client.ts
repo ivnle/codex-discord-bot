@@ -50,6 +50,8 @@ export interface CodexClient {
   startThread(options: CodexThreadOptions): Promise<string>;
   resumeThread(threadId: string, options?: CodexThreadOptions): Promise<string>;
   startTurn(request: CodexStartTurnRequest): Promise<void>;
+  interrupt(): Promise<void>;
+  compact(threadId: string): Promise<void>;
   onFinalMessage(handler: CodexFinalMessageHandler): void;
   onTurnCompleted(handler: CodexTurnCompletedHandler): void;
   onApprovalRequest(handler: CodexApprovalRequestHandler): void;

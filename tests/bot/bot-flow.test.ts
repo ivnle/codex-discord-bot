@@ -564,6 +564,274 @@ describe("CodexDiscordBot", () => {
     ]);
   });
 
+  it("stops an active turn immediately without queuing or sending the command to Codex", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "first"));
+    await discord.emitMessage(message("message-2", "second"));
+    await discord.emitMessage(message("message-3", "!STOP"));
+
+    expect(codex.interruptCalls).toBe(1);
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual(["first"]);
+    expect(discord.sentMessages).toEqual([
+      { channelId: "channel-1", content: "Stopped the current turn." }
+    ]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    await codex.emitTurnCompleted({ threadId: "thread-1" });
+
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual(["first"]);
+  });
+
+  it("reports that nothing is running when stop is requested with no active turn", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "!cancel"));
+
+    expect(codex.interruptCalls).toBe(0);
+    expect(codex.turns).toEqual([]);
+    expect(discord.sentMessages).toEqual([
+      { channelId: "channel-1", content: "Nothing is running." }
+    ]);
+  });
+
+  it("compacts the current thread without starting a Codex turn", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "!compact"));
+
+    expect(codex.compactedThreadIds).toEqual(["thread-1"]);
+    expect(codex.turns).toEqual([]);
+    expect(discord.sentMessages).toEqual([
+      { channelId: "channel-1", content: "Compacted the conversation." }
+    ]);
+  });
+
+  it("asks the operator to stop before compacting an active turn", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "first"));
+    await discord.emitMessage(message("message-2", "!compact"));
+
+    expect(codex.compactedThreadIds).toEqual([]);
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual(["first"]);
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content: "A turn is running. Send !stop before !compact."
+      }
+    ]);
+  });
+
+  it("starts and persists a fresh thread on reset while clearing active state and queue", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    codex.nextThreadIds = ["thread-1", "thread-2"];
+    const state = new ThreadStateStore(dataDir);
+    await new CodexDiscordBot(configFor(dataDir), discord, codex, state).start(
+      "gateway-auth-value"
+    );
+
+    await discord.emitMessage(message("message-1", "first"));
+    await discord.emitMessage(message("message-2", "second"));
+    await discord.emitMessage(message("message-3", "!new"));
+
+    expect(codex.startedThreads).toHaveLength(2);
+    await expect(state.readThreadId()).resolves.toBe("thread-2");
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content: "Started a fresh thread (history cleared)."
+      }
+    ]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    await codex.emitTurnCompleted({ threadId: "thread-1" });
+
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual(["first"]);
+  });
+
+  it("posts help locally without starting a Codex turn", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "!help"));
+
+    expect(codex.turns).toEqual([]);
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content:
+          "Available commands: !stop/!cancel stop the current turn; !compact compact the conversation; !reset/!new start a fresh thread; !help show this help."
+      }
+    ]);
+  });
+
+  it("ignores control commands from messages that fail access control", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage({
+      ...message("message-1", "!compact"),
+      authorId: "user-2"
+    });
+
+    expect(codex.compactedThreadIds).toEqual([]);
+    expect(codex.turns).toEqual([]);
+    expect(discord.sentMessages).toEqual([]);
+  });
+
+  it("treats command text embedded in a sentence as normal input", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "please !stop now"));
+
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual([
+      "please !stop now"
+    ]);
+    expect(codex.interruptCalls).toBe(0);
+  });
+
+  it("reports interrupt failures without crashing", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    codex.interruptError = new Error("interrupt unavailable");
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "first"));
+
+    await expect(
+      discord.emitMessage(message("message-2", "!stop"))
+    ).resolves.toBeUndefined();
+    expect(consoleError).toHaveBeenCalled();
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content: "Couldn't stop the turn: interrupt unavailable"
+      }
+    ]);
+  });
+
+  it("reports compact failures without crashing", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    codex.compactError = new Error("compact unavailable");
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await expect(
+      discord.emitMessage(message("message-1", "!compact"))
+    ).resolves.toBeUndefined();
+    expect(consoleError).toHaveBeenCalled();
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content: "Couldn't compact the conversation: compact unavailable"
+      }
+    ]);
+  });
+
+  it("reports reset failures without crashing", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+    codex.startThreadError = new Error("start unavailable");
+
+    await expect(
+      discord.emitMessage(message("message-1", "!reset"))
+    ).resolves.toBeUndefined();
+    expect(consoleError).toHaveBeenCalled();
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content: "Couldn't reset the conversation: start unavailable"
+      }
+    ]);
+  });
+
   it("bridges approval prompts and ignores approval choices from unauthorized users", async () => {
     const dataDir = await tempDataDir();
     const discord = new FakeDiscordGateway();
@@ -769,8 +1037,14 @@ class FakeTranscriber implements Transcriber {
 class FakeCodexClient implements CodexClient {
   connectCalls = 0;
   startedThreads: CodexThreadOptions[] = [];
+  startThreadError: Error | undefined;
+  nextThreadIds = ["thread-1"];
   resumedThreads: string[] = [];
   turns: CodexStartTurnRequest[] = [];
+  interruptCalls = 0;
+  interruptError: Error | undefined;
+  compactedThreadIds: string[] = [];
+  compactError: Error | undefined;
   approvalResponses: Array<{ rpcId: string; response: Record<string, unknown> }> =
     [];
   private readonly finalHandlers: CodexFinalMessageHandler[] = [];
@@ -782,8 +1056,11 @@ class FakeCodexClient implements CodexClient {
   }
 
   async startThread(options: CodexThreadOptions): Promise<string> {
+    if (this.startThreadError) {
+      throw this.startThreadError;
+    }
     this.startedThreads.push(options);
-    return "thread-1";
+    return this.nextThreadIds.shift() ?? `thread-${this.startedThreads.length}`;
   }
 
   async resumeThread(threadId: string): Promise<string> {
@@ -793,6 +1070,20 @@ class FakeCodexClient implements CodexClient {
 
   async startTurn(request: CodexStartTurnRequest): Promise<void> {
     this.turns.push(request);
+  }
+
+  async interrupt(): Promise<void> {
+    this.interruptCalls += 1;
+    if (this.interruptError) {
+      throw this.interruptError;
+    }
+  }
+
+  async compact(threadId: string): Promise<void> {
+    if (this.compactError) {
+      throw this.compactError;
+    }
+    this.compactedThreadIds.push(threadId);
   }
 
   onFinalMessage(handler: CodexFinalMessageHandler): void {
