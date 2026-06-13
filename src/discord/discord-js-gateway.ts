@@ -26,6 +26,10 @@ type SendableTextChannel = {
   send(payload: MessageCreateOptions): Promise<unknown>;
 };
 
+type TypingTextChannel = {
+  sendTyping(): Promise<void>;
+};
+
 export interface DiscordMessageLike {
   id: string;
   author: {
@@ -148,6 +152,26 @@ export class DiscordJsGateway implements DiscordGateway {
 
   async sendMessage(channelId: string, content: string): Promise<void> {
     await this.sendToChannel(channelId, { content });
+  }
+
+  async sendTyping(channelId: string): Promise<void> {
+    try {
+      const channel = await this.client.channels.fetch(channelId);
+      if (
+        !channel ||
+        !channel.isTextBased() ||
+        !("sendTyping" in channel) ||
+        typeof channel.sendTyping !== "function"
+      ) {
+        throw new Error(`Discord channel ${channelId} is not text based`);
+      }
+      await (channel as TypingTextChannel).sendTyping();
+    } catch (error) {
+      console.error(
+        `Failed to send Discord typing indicator to channel ${channelId}`,
+        error
+      );
+    }
   }
 
   async sendApprovalPrompt(

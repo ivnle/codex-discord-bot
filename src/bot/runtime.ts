@@ -17,6 +17,8 @@ import { chunkReply } from "../replies/chunk.js";
 import type { ThreadStateStore } from "../state/thread-state.js";
 import { CliTranscriber, type Transcriber } from "../transcription/transcriber.js";
 
+const TYPING_REFRESH_MS = 8000;
+
 interface QueuedMessage {
   message: DiscordMessage;
 }
@@ -25,6 +27,7 @@ export class CodexDiscordBot {
   private threadId: string | undefined;
   private activeTurn = false;
   private activeReplyChannelId: string | undefined;
+  private typingInterval: ReturnType<typeof setInterval> | undefined;
   private readonly queue: QueuedMessage[] = [];
   private readonly approvalsById = new Map<string, ApprovalRequest>();
 
@@ -54,6 +57,7 @@ export class CodexDiscordBot {
   }
 
   async stop(): Promise<void> {
+    this.stopTypingKeepAlive();
     await this.discord.stop();
     await this.codex.stop?.();
   }
@@ -133,6 +137,7 @@ export class CodexDiscordBot {
 
     this.activeTurn = true;
     this.activeReplyChannelId = message.channelId;
+    this.startTypingKeepAlive(message.channelId);
     await this.codex.startTurn({
       threadId: this.threadId,
       clientUserMessageId: message.id,
@@ -154,8 +159,12 @@ export class CodexDiscordBot {
     }
 
     const channelId = this.activeReplyChannelId;
-    for (const chunk of chunkReply(message.text)) {
-      await this.discord.sendMessage(channelId, chunk);
+    try {
+      for (const chunk of chunkReply(message.text)) {
+        await this.discord.sendMessage(channelId, chunk);
+      }
+    } finally {
+      this.stopTypingKeepAlive();
     }
   }
 
@@ -163,6 +172,7 @@ export class CodexDiscordBot {
     if (message.threadId !== this.threadId || !this.activeTurn) {
       return;
     }
+    this.stopTypingKeepAlive();
     this.activeTurn = false;
     this.activeReplyChannelId = undefined;
     await this.startNextQueuedTurn();
@@ -214,6 +224,33 @@ export class CodexDiscordBot {
 
     await this.codex.sendApprovalResponse(result.rpcId, result.response);
     this.approvalsById.delete(choice.approvalId);
+  }
+
+  private startTypingKeepAlive(channelId: string): void {
+    this.stopTypingKeepAlive();
+    void this.sendTypingBestEffort(channelId);
+    this.typingInterval = setInterval(() => {
+      void this.sendTypingBestEffort(channelId);
+    }, TYPING_REFRESH_MS);
+  }
+
+  private stopTypingKeepAlive(): void {
+    if (!this.typingInterval) {
+      return;
+    }
+    clearInterval(this.typingInterval);
+    this.typingInterval = undefined;
+  }
+
+  private async sendTypingBestEffort(channelId: string): Promise<void> {
+    try {
+      await this.discord.sendTyping(channelId);
+    } catch (error) {
+      console.error(
+        `Failed to send Discord typing indicator to channel ${channelId}`,
+        error
+      );
+    }
   }
 
   private threadOptions(): CodexThreadOptions {

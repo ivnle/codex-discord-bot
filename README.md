@@ -24,7 +24,8 @@ node dist/main.js examples/bot.yaml
 The bot launches the configured local `codex app-server --stdio` command, starts
 or resumes one Codex thread, accepts messages only from allowlisted users and
 opted-in channels, queues turns FIFO, and posts final assistant replies back to
-Discord.
+Discord. While Codex is working on an active turn, the bot keeps Discord's
+typing indicator visible in the reply channel.
 
 ### Voice transcription
 

@@ -39,6 +39,7 @@ export interface DiscordGateway {
   start(token: string): Promise<void>;
   stop(): Promise<void>;
   sendMessage(channelId: string, content: string): Promise<void>;
+  sendTyping(channelId: string): Promise<void>;
   sendApprovalPrompt(
     channelId: string,
     approvalId: string,

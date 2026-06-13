@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CodexDiscordBot } from "../../src/bot/runtime.js";
 import { AppServerCodexClient } from "../../src/codex/app-server-client.js";
@@ -37,6 +37,8 @@ async function tempDataDir(): Promise<string> {
 }
 
 afterEach(async () => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   await Promise.all(
     createdDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))
   );
@@ -185,6 +187,174 @@ describe("CodexDiscordBot", () => {
       commentaryText: "commentary should not be posted",
       finalText: "final answer"
     });
+
+    expect(discord.sentMessages).toEqual([
+      { channelId: "channel-1", content: "final answer" }
+    ]);
+  });
+
+  it("sends typing immediately and refreshes while a turn is active", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    const bot = new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    );
+    await bot.start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "hello Codex"));
+
+    expect(discord.typingCalls).toEqual([{ channelId: "channel-1" }]);
+    expect(vi.getTimerCount()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(discord.typingCalls).toEqual([
+      { channelId: "channel-1" },
+      { channelId: "channel-1" }
+    ]);
+
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(discord.typingCalls).toEqual([
+      { channelId: "channel-1" },
+      { channelId: "channel-1" },
+      { channelId: "channel-1" },
+      { channelId: "channel-1" }
+    ]);
+
+    await bot.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("stops typing after the final reply is posted", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "hello Codex"));
+    expect(vi.getTimerCount()).toBe(1);
+
+    await codex.emitFinalMessage({ threadId: "thread-1", text: "final answer" });
+
+    expect(discord.sentMessages).toEqual([
+      { channelId: "channel-1", content: "final answer" }
+    ]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(24000);
+    expect(discord.typingCalls).toEqual([{ channelId: "channel-1" }]);
+  });
+
+  it("stops typing for a tool-only completed turn", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "run a tool"));
+    expect(vi.getTimerCount()).toBe(1);
+
+    await codex.emitTurnCompleted({ threadId: "thread-1" });
+
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(24000);
+    expect(discord.typingCalls).toEqual([{ channelId: "channel-1" }]);
+  });
+
+  it("restarts typing for the next queued turn without overlapping timers", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "first"));
+    await discord.emitMessage(message("message-2", "second"));
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual(["first"]);
+    expect(discord.typingCalls).toEqual([{ channelId: "channel-1" }]);
+    expect(vi.getTimerCount()).toBe(1);
+
+    await codex.emitTurnCompleted({ threadId: "thread-1" });
+
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual([
+      "first",
+      "second"
+    ]);
+    expect(discord.typingCalls).toEqual([
+      { channelId: "channel-1" },
+      { channelId: "channel-1" }
+    ]);
+    expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("clears the typing interval when the bot stops", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    const bot = new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    );
+    await bot.start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "hello Codex"));
+    expect(vi.getTimerCount()).toBe(1);
+
+    await bot.stop();
+
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(24000);
+    expect(discord.typingCalls).toEqual([{ channelId: "channel-1" }]);
+  });
+
+  it("keeps the turn running when sending typing fails", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    discord.typingError = new Error("typing unavailable");
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "hello Codex"));
+    await Promise.resolve();
+
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual([
+      "hello Codex"
+    ]);
+    expect(consoleError).toHaveBeenCalled();
+
+    await codex.emitFinalMessage({ threadId: "thread-1", text: "final answer" });
 
     expect(discord.sentMessages).toEqual([
       { channelId: "channel-1", content: "final answer" }
@@ -529,6 +699,8 @@ function asRecord(value: unknown): Record<string, unknown> {
 class FakeDiscordGateway implements DiscordGateway {
   startedToken: string | undefined;
   sentMessages: Array<{ channelId: string; content: string }> = [];
+  typingCalls: Array<{ channelId: string }> = [];
+  typingError: Error | undefined;
   sentPrompts: Array<{
     channelId: string;
     approvalId: string;
@@ -553,6 +725,13 @@ class FakeDiscordGateway implements DiscordGateway {
 
   async sendMessage(channelId: string, content: string): Promise<void> {
     this.sentMessages.push({ channelId, content });
+  }
+
+  async sendTyping(channelId: string): Promise<void> {
+    this.typingCalls.push({ channelId });
+    if (this.typingError) {
+      throw this.typingError;
+    }
   }
 
   async sendApprovalPrompt(
