@@ -9,6 +9,8 @@ codex:
   model: gpt-5.5
   sandbox: workspace-write
   approval_policy: on-request
+  # Optional per-bot custom instructions; relative paths resolve from codex.cwd.
+  # instructions_file: .codex/bot-instructions.md
 access:
   allow_user_ids: []
   channels: []

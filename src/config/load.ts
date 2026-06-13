@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 
 import YAML from "yaml";
@@ -68,6 +69,11 @@ export function loadConfigFromString(
   const command = optionalString(codexRaw?.command, "codex.command", issues);
   const args = optionalStringArray(codexRaw?.args, "codex.args", issues);
   const model = optionalString(codexRaw?.model, "codex.model", issues);
+  const instructionsFile = optionalString(
+    codexRaw?.instructions_file,
+    "codex.instructions_file",
+    issues
+  );
   const sandbox = optionalEnum(
     codexRaw?.sandbox,
     "codex.sandbox",
@@ -118,6 +124,14 @@ export function loadConfigFromString(
           "transcription.binary",
           issues
         );
+  const resolvedInstructionsFile = instructionsFile
+    ? resolveConfigPath(instructionsFile, cwd)
+    : undefined;
+  if (resolvedInstructionsFile && !existsSync(resolvedInstructionsFile)) {
+    issues.push(
+      `codex.instructions_file does not exist: ${resolvedInstructionsFile}`
+    );
+  }
 
   if (issues.length > 0) {
     throw new ConfigValidationError(
@@ -135,7 +149,10 @@ export function loadConfigFromString(
       cwd,
       ...(model ? { model } : {}),
       ...(sandbox ? { sandbox } : {}),
-      ...(approvalPolicy ? { approvalPolicy } : {})
+      ...(approvalPolicy ? { approvalPolicy } : {}),
+      ...(resolvedInstructionsFile
+        ? { instructionsFile: resolvedInstructionsFile }
+        : {})
     },
     access: {
       allowUserIds: allowUserIds ?? [],

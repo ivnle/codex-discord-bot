@@ -15,6 +15,7 @@ export interface BotConfig {
     model?: string;
     sandbox?: SandboxMode;
     approvalPolicy?: ApprovalPolicy;
+    instructionsFile?: string;
   };
   access: {
     allowUserIds: string[];

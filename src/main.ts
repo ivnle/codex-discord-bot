@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { CodexDiscordBot } from "./bot/runtime.js";
 import { AppServerCodexClient } from "./codex/app-server-client.js";
+import { buildCodexArgs } from "./codex/args.js";
 import { StdioJsonRpcTransport } from "./codex/stdio-transport.js";
 import { loadConfig, resolveDiscordToken } from "./config/load.js";
 import { DiscordJsGateway } from "./discord/discord-js-gateway.js";
@@ -29,7 +30,7 @@ export async function runMain(
 
   const transport = new StdioJsonRpcTransport(
     config.codex.command,
-    config.codex.args,
+    buildCodexArgs(config.codex),
     {
       cwd: config.codex.cwd
     }

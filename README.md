@@ -27,6 +27,26 @@ opted-in channels, queues turns FIFO, and posts final assistant replies back to
 Discord. While Codex is working on an active turn, the bot keeps Discord's
 typing indicator visible in the reply channel.
 
+### Custom instructions / per-bot prompt
+
+Each bot config can opt into a custom instructions file:
+
+```yaml
+codex:
+  cwd: /path/to/project
+  instructions_file: .codex/bot-instructions.md
+```
+
+The bot expands `~`, resolves relative `instructions_file` paths from
+`codex.cwd`, verifies the file exists during startup, and launches Codex with
+`-c model_instructions_file=<absolute path>` before the `app-server` subcommand.
+The setting is per bot config, so different bot processes can use different
+instruction files.
+
+`model_instructions_file` may override Codex's built-in base instructions
+rather than append to them. Write the file deliberately, and confirm the
+replace-vs-append behavior for the Codex version you run before relying on it.
+
 ### Voice transcription
 
 Voice notes and audio attachments are ignored by default. To opt in, enable the
