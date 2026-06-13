@@ -16,12 +16,18 @@ import type {
 import { chunkReply } from "../replies/chunk.js";
 import type { ThreadStateStore } from "../state/thread-state.js";
 import { CliTranscriber, type Transcriber } from "../transcription/transcriber.js";
+import { formatContextUsage } from "./context-usage.js";
 
 const TYPING_REFRESH_MS = 8000;
 const CONTROL_HELP =
-  "Available commands: !stop/!cancel stop the current turn; !compact compact the conversation; !reset/!new start a fresh thread; !help show this help.";
+  "**Commands**\n" +
+  "`!stop` / `!cancel` — interrupt the current turn\n" +
+  "`!compact` — compact the conversation (frees up context)\n" +
+  "`!reset` / `!new` — start a fresh thread (clears history)\n" +
+  "`!context` — show context-window usage\n" +
+  "`!help` — show this help";
 
-type ControlCommand = "stop" | "compact" | "reset" | "help";
+type ControlCommand = "stop" | "compact" | "reset" | "context" | "help";
 
 interface QueuedMessage {
   message: DiscordMessage;
@@ -125,6 +131,12 @@ export class CodexDiscordBot {
         return;
       case "reset":
         await this.resetThread(message.channelId);
+        return;
+      case "context":
+        await this.discord.sendMessage(
+          message.channelId,
+          formatContextUsage(this.codex.getTokenUsage())
+        );
         return;
       case "help":
         await this.discord.sendMessage(message.channelId, CONTROL_HELP);
@@ -397,6 +409,8 @@ function parseControlCommand(content: string): ControlCommand | undefined {
     case "!reset":
     case "!new":
       return "reset";
+    case "!context":
+      return "context";
     case "!help":
       return "help";
     default:

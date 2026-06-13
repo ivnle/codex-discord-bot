@@ -5,7 +5,8 @@ import type {
   CodexRpcId,
   CodexStartTurnRequest,
   CodexThreadOptions,
-  CodexTurnCompletedHandler
+  CodexTurnCompletedHandler,
+  ThreadTokenUsage
 } from "./client.js";
 import { JsonRpcPeer, type JsonRpcMessage, type JsonRpcTransport } from "./json-rpc.js";
 
@@ -30,6 +31,7 @@ export class AppServerCodexClient implements CodexClient {
   private readonly turnCompletedHandlers: CodexTurnCompletedHandler[] = [];
   private readonly approvalHandlers: CodexApprovalRequestHandler[] = [];
   private readonly compactWaiters = new Map<string, CompactWaiter>();
+  private readonly tokenUsageByThreadId = new Map<string, ThreadTokenUsage>();
   private currentThreadId: string | undefined;
   private currentTurnId: string | undefined;
 
@@ -120,6 +122,12 @@ export class AppServerCodexClient implements CodexClient {
     }
   }
 
+  getTokenUsage(): ThreadTokenUsage | undefined {
+    return this.currentThreadId
+      ? this.tokenUsageByThreadId.get(this.currentThreadId)
+      : undefined;
+  }
+
   onFinalMessage(handler: CodexFinalMessageHandler): void {
     this.finalHandlers.push(handler);
   }
@@ -144,6 +152,14 @@ export class AppServerCodexClient implements CodexClient {
     const threadId = typeof params.threadId === "string" ? params.threadId : "";
 
     if (!threadId) {
+      return;
+    }
+
+    if (message.method === "thread/tokenUsage/updated") {
+      const tokenUsage = asThreadTokenUsage(params.tokenUsage);
+      if (tokenUsage) {
+        this.tokenUsageByThreadId.set(threadId, tokenUsage);
+      }
       return;
     }
 
@@ -284,4 +300,59 @@ function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function asThreadTokenUsage(value: unknown): ThreadTokenUsage | undefined {
+  const usage = asRecord(value);
+  const total = asTokenUsageBreakdown(usage.total);
+  const last = asTokenUsageBreakdown(usage.last);
+  const modelContextWindow = usage.modelContextWindow;
+  if (
+    !total ||
+    !last ||
+    !(
+      modelContextWindow === null ||
+      isFiniteNumber(modelContextWindow)
+    )
+  ) {
+    return undefined;
+  }
+  return {
+    total,
+    last,
+    modelContextWindow
+  };
+}
+
+function asTokenUsageBreakdown(
+  value: unknown
+): ThreadTokenUsage["total"] | undefined {
+  const breakdown = asRecord(value);
+  const {
+    totalTokens,
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens
+  } = breakdown;
+  if (
+    !isFiniteNumber(totalTokens) ||
+    !isFiniteNumber(inputTokens) ||
+    !isFiniteNumber(cachedInputTokens) ||
+    !isFiniteNumber(outputTokens) ||
+    !isFiniteNumber(reasoningOutputTokens)
+  ) {
+    return undefined;
+  }
+  return {
+    totalTokens,
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens
+  };
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }

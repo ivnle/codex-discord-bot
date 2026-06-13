@@ -282,6 +282,49 @@ describe("AppServerCodexClient", () => {
     expect(completedTurns).toEqual([{ threadId: "thread-1" }]);
   });
 
+  it("stores latest token usage notifications for the current thread", async () => {
+    const transport = new FakeAppServerTransport();
+    const client = new AppServerCodexClient(transport);
+    await client.connect();
+    await client.startThread({ cwd: "/tmp/project" });
+
+    const threadOneUsage = tokenUsage({
+      totalTokens: 1_200_000,
+      inputTokens: 45_000,
+      modelContextWindow: 272_000
+    });
+    transport.emit({
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        tokenUsage: threadOneUsage
+      }
+    });
+
+    expect(readTokenUsage(client)).toEqual(threadOneUsage);
+
+    const threadTwoUsage = tokenUsage({
+      totalTokens: 2_000_000,
+      inputTokens: 10_000,
+      modelContextWindow: null
+    });
+    transport.emit({
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "thread-2",
+        turnId: "turn-1",
+        tokenUsage: threadTwoUsage
+      }
+    });
+
+    expect(readTokenUsage(client)).toEqual(threadOneUsage);
+
+    await client.resumeThread("thread-2", { cwd: "/tmp/project" });
+
+    expect(readTokenUsage(client)).toEqual(threadTwoUsage);
+  });
+
   it("forwards approval requests and writes app-server responses", async () => {
     const transport = new FakeAppServerTransport();
     const client = new AppServerCodexClient(transport);
@@ -328,4 +371,49 @@ async function flushAsyncProtocol(): Promise<void> {
   for (let index = 0; index < 5; index += 1) {
     await Promise.resolve();
   }
+}
+
+function readTokenUsage(client: AppServerCodexClient): unknown {
+  return (client as unknown as { getTokenUsage: () => unknown }).getTokenUsage();
+}
+
+function tokenUsage({
+  totalTokens,
+  inputTokens,
+  modelContextWindow
+}: {
+  totalTokens: number;
+  inputTokens: number;
+  modelContextWindow: number | null;
+}): {
+  total: TokenUsageBreakdownForTest;
+  last: TokenUsageBreakdownForTest;
+  modelContextWindow: number | null;
+} {
+  return {
+    total: tokenBreakdown({ totalTokens }),
+    last: tokenBreakdown({ inputTokens }),
+    modelContextWindow
+  };
+}
+
+type TokenUsageBreakdownForTest = {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+};
+
+function tokenBreakdown(
+  overrides: Partial<TokenUsageBreakdownForTest>
+): TokenUsageBreakdownForTest {
+  return {
+    totalTokens: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    ...overrides
+  };
 }

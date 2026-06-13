@@ -45,6 +45,20 @@ export type CodexApprovalRequestHandler = (
 
 export type CodexRpcId = string | number;
 
+export interface TokenUsageBreakdown {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+}
+
+export interface ThreadTokenUsage {
+  total: TokenUsageBreakdown;
+  last: TokenUsageBreakdown;
+  modelContextWindow: number | null;
+}
+
 export interface CodexClient {
   connect(): Promise<void>;
   startThread(options: CodexThreadOptions): Promise<string>;
@@ -52,6 +66,7 @@ export interface CodexClient {
   startTurn(request: CodexStartTurnRequest): Promise<void>;
   interrupt(): Promise<boolean>;
   compact(threadId: string): Promise<void>;
+  getTokenUsage(): ThreadTokenUsage | undefined;
   onFinalMessage(handler: CodexFinalMessageHandler): void;
   onTurnCompleted(handler: CodexTurnCompletedHandler): void;
   onApprovalRequest(handler: CodexApprovalRequestHandler): void;

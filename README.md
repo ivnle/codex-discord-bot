@@ -40,6 +40,7 @@ Codex as prompts:
   operator to send `!stop` first so compaction does not race a live turn.
 - `!reset` or `!new`: start a fresh thread, persist its thread id, clear active
   state, and drop queued messages.
+- `!context`: show current context-window usage and cumulative session tokens.
 - `!help`: show the command list.
 
 ### Custom instructions / per-bot prompt

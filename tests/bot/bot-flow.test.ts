@@ -30,6 +30,20 @@ import { FakeAppServerTransport } from "../fakes/fake-app-server-transport.js";
 
 const createdDirs: string[] = [];
 
+type TestTokenUsageBreakdown = {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+};
+
+type TestThreadTokenUsage = {
+  total: TestTokenUsageBreakdown;
+  last: TestTokenUsageBreakdown;
+  modelContextWindow: number | null;
+};
+
 async function tempDataDir(): Promise<string> {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-discord-bot-flow-"));
   createdDirs.push(dir);
@@ -841,7 +855,150 @@ describe("CodexDiscordBot", () => {
       {
         channelId: "channel-1",
         content:
-          "Available commands: !stop/!cancel stop the current turn; !compact compact the conversation; !reset/!new start a fresh thread; !help show this help."
+          "**Commands**\n" +
+          "`!stop` / `!cancel` — interrupt the current turn\n" +
+          "`!compact` — compact the conversation (frees up context)\n" +
+          "`!reset` / `!new` — start a fresh thread (clears history)\n" +
+          "`!context` — show context-window usage\n" +
+          "`!help` — show this help"
+      }
+    ]);
+  });
+
+  it("lists every control command in help", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "!help"));
+
+    const help = discord.sentMessages[0]?.content ?? "";
+    expect(help).toContain("!stop");
+    expect(help).toContain("!cancel");
+    expect(help).toContain("!compact");
+    expect(help).toContain("!reset");
+    expect(help).toContain("!new");
+    expect(help).toContain("!context");
+    expect(help).toContain("!help");
+  });
+
+  it("posts context usage locally during an active turn without starting another turn", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    codex.tokenUsage = tokenUsage({
+      totalTokens: 1_200_000,
+      inputTokens: 45_000,
+      modelContextWindow: 272_000
+    });
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "first"));
+    await discord.emitMessage(message("message-2", "!context"));
+
+    expect(codex.turns.map((turn) => turn.input[0]?.text)).toEqual(["first"]);
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content:
+          "Context: ~45K / 272K (17% of window)\nSession total: 1.2M tokens"
+      }
+    ]);
+  });
+
+  it("posts context usage after an app-server token usage notification", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const transport = new FakeAppServerTransport();
+    const codex = new AppServerCodexClient(transport);
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    transport.emit({
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        tokenUsage: tokenUsage({
+          totalTokens: 1_200_000,
+          inputTokens: 45_000,
+          modelContextWindow: 272_000
+        })
+      }
+    });
+    await discord.emitMessage(message("message-1", "!context"));
+
+    expect(turnStartTexts(transport)).toEqual([]);
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content:
+          "Context: ~45K / 272K (17% of window)\nSession total: 1.2M tokens"
+      }
+    ]);
+  });
+
+  it("reports when no context usage data has been received yet without starting a turn", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "!context"));
+
+    expect(codex.turns).toEqual([]);
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content: "No usage data yet — send a message first."
+      }
+    ]);
+  });
+
+  it("posts context usage without a window denominator when the window is unknown", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const codex = new FakeCodexClient();
+    codex.tokenUsage = tokenUsage({
+      totalTokens: 1_200_000,
+      inputTokens: 45_000,
+      modelContextWindow: null
+    });
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    await discord.emitMessage(message("message-1", "!context"));
+
+    expect(codex.turns).toEqual([]);
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content:
+          "Context: ~45K used (window size unknown)\nSession total: 1.2M tokens"
       }
     ]);
   });
@@ -1083,6 +1240,35 @@ function commandApprovalRequest(id: string): Record<string, unknown> {
   };
 }
 
+function tokenUsage({
+  totalTokens,
+  inputTokens,
+  modelContextWindow
+}: {
+  totalTokens: number;
+  inputTokens: number;
+  modelContextWindow: number | null;
+}): TestThreadTokenUsage {
+  return {
+    total: tokenBreakdown({ totalTokens }),
+    last: tokenBreakdown({ inputTokens }),
+    modelContextWindow
+  };
+}
+
+function tokenBreakdown(
+  overrides: Partial<TestTokenUsageBreakdown>
+): TestTokenUsageBreakdown {
+  return {
+    totalTokens: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    ...overrides
+  };
+}
+
 function turnStartTexts(transport: FakeAppServerTransport): string[] {
   return transport
     .sentRequests()
@@ -1189,6 +1375,7 @@ class FakeCodexClient implements CodexClient {
   interruptError: Error | undefined;
   compactedThreadIds: string[] = [];
   compactError: Error | undefined;
+  tokenUsage: TestThreadTokenUsage | undefined;
   approvalResponses: Array<{ rpcId: string; response: Record<string, unknown> }> =
     [];
   private readonly finalHandlers: CodexFinalMessageHandler[] = [];
@@ -1229,6 +1416,10 @@ class FakeCodexClient implements CodexClient {
       throw this.compactError;
     }
     this.compactedThreadIds.push(threadId);
+  }
+
+  getTokenUsage(): TestThreadTokenUsage | undefined {
+    return this.tokenUsage;
   }
 
   onFinalMessage(handler: CodexFinalMessageHandler): void {
