@@ -1,8 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AppServerCodexClient } from "../../src/codex/app-server-client.js";
 import { JsonRpcPeer } from "../../src/codex/json-rpc.js";
 import { FakeAppServerTransport } from "../fakes/fake-app-server-transport.js";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("AppServerCodexClient", () => {
   it("initializes app-server, starts/resumes threads, and starts turns", async () => {
@@ -29,7 +33,13 @@ describe("AppServerCodexClient", () => {
       approvalPolicy: "on-request"
     });
     await expect(client.interrupt()).resolves.toBe(true);
-    await client.compact(threadId);
+    const compactPromise = client.compact(threadId);
+    await flushAsyncProtocol();
+    transport.emit({
+      method: "thread/compacted",
+      params: { threadId, turnId: "compact-turn-1" }
+    });
+    await compactPromise;
 
     expect(transport.started).toBe(true);
     expect(transport.sentRequests()).toMatchObject([
@@ -91,6 +101,68 @@ describe("AppServerCodexClient", () => {
         }
       }
     ]);
+  });
+
+  it("waits for a matching thread/compacted notification before compact resolves", async () => {
+    const transport = new FakeAppServerTransport();
+    const client = new AppServerCodexClient(transport);
+    await client.connect();
+
+    const compactPromise = client.compact("thread-1");
+    let settled = false;
+    void compactPromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      }
+    );
+
+    await flushAsyncProtocol();
+    expect(transport.sentRequests().at(-1)).toMatchObject({
+      method: "thread/compact/start",
+      params: { threadId: "thread-1" }
+    });
+    expect(settled).toBe(false);
+
+    transport.emit({
+      method: "thread/compacted",
+      params: { threadId: "thread-2", turnId: "compact-turn-2" }
+    });
+    await flushAsyncProtocol();
+    expect(settled).toBe(false);
+
+    transport.emit({
+      method: "thread/compacted",
+      params: { threadId: "thread-1", turnId: "compact-turn-1" }
+    });
+
+    await expect(compactPromise).resolves.toBeUndefined();
+    expect(settled).toBe(true);
+  });
+
+  it("rejects compact when no matching completion notification arrives", async () => {
+    vi.useFakeTimers();
+    const transport = new FakeAppServerTransport();
+    const client = new AppServerCodexClient(transport);
+    await client.connect();
+
+    const compactPromise = client.compact("thread-1");
+    const compactResult = compactPromise.then(
+      () => ({ status: "resolved" as const }),
+      (error: unknown) => ({ status: "rejected" as const, error })
+    );
+
+    await flushAsyncProtocol();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    await expect(compactResult).resolves.toMatchObject({
+      status: "rejected",
+      error: expect.objectContaining({
+        message: "Timed out waiting for Codex compaction to finish for thread thread-1"
+      })
+    });
   });
 
   it("does not send interrupt when no turn id is known", async () => {
@@ -239,3 +311,9 @@ describe("AppServerCodexClient", () => {
     });
   });
 });
+
+async function flushAsyncProtocol(): Promise<void> {
+  for (let index = 0; index < 5; index += 1) {
+    await Promise.resolve();
+  }
+}

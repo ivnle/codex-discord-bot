@@ -16,12 +16,20 @@ const APPROVAL_REQUEST_METHODS = new Set([
   "execCommandApproval",
   "applyPatchApproval"
 ]);
+const COMPACT_TIMEOUT_MS = 60_000;
+
+type CompactWaiter = {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+};
 
 export class AppServerCodexClient implements CodexClient {
   private readonly peer: JsonRpcPeer;
   private readonly finalHandlers: CodexFinalMessageHandler[] = [];
   private readonly turnCompletedHandlers: CodexTurnCompletedHandler[] = [];
   private readonly approvalHandlers: CodexApprovalRequestHandler[] = [];
+  private readonly compactWaiters = new Map<string, CompactWaiter>();
   private currentThreadId: string | undefined;
   private currentTurnId: string | undefined;
 
@@ -96,7 +104,20 @@ export class AppServerCodexClient implements CodexClient {
   }
 
   async compact(threadId: string): Promise<void> {
-    await this.peer.request("thread/compact/start", { threadId });
+    const completion = this.waitForCompactCompletion(threadId).then(
+      () => ({ status: "resolved" as const }),
+      (error: unknown) => ({ status: "rejected" as const, error })
+    );
+    try {
+      await this.peer.request("thread/compact/start", { threadId });
+    } catch (error) {
+      this.clearCompactWaiter(threadId);
+      throw error;
+    }
+    const result = await completion;
+    if (result.status === "rejected") {
+      throw result.error;
+    }
   }
 
   onFinalMessage(handler: CodexFinalMessageHandler): void {
@@ -152,6 +173,13 @@ export class AppServerCodexClient implements CodexClient {
       return;
     }
 
+    if (message.method === "thread/compacted") {
+      // This raw JSON-RPC client has no generated ContextCompaction item binding,
+      // so it uses the explicit completion notification from the app-server.
+      this.resolveCompactWaiter(threadId);
+      return;
+    }
+
     if (message.method === "turn/completed") {
       const turn = asRecord(params.turn);
       const turnId = typeof turn.id === "string" ? turn.id : undefined;
@@ -180,6 +208,43 @@ export class AppServerCodexClient implements CodexClient {
     for (const handler of this.approvalHandlers) {
       void handler(request);
     }
+  }
+
+  private waitForCompactCompletion(threadId: string): Promise<void> {
+    if (this.compactWaiters.has(threadId)) {
+      throw new Error(`Compaction is already pending for thread ${threadId}`);
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.compactWaiters.delete(threadId);
+        reject(
+          new Error(
+            `Timed out waiting for Codex compaction to finish for thread ${threadId}`
+          )
+        );
+      }, COMPACT_TIMEOUT_MS);
+      this.compactWaiters.set(threadId, { resolve, reject, timeout });
+    });
+  }
+
+  private resolveCompactWaiter(threadId: string): void {
+    const waiter = this.compactWaiters.get(threadId);
+    if (!waiter) {
+      return;
+    }
+    this.compactWaiters.delete(threadId);
+    clearTimeout(waiter.timeout);
+    waiter.resolve();
+  }
+
+  private clearCompactWaiter(threadId: string): void {
+    const waiter = this.compactWaiters.get(threadId);
+    if (!waiter) {
+      return;
+    }
+    this.compactWaiters.delete(threadId);
+    clearTimeout(waiter.timeout);
   }
 }
 

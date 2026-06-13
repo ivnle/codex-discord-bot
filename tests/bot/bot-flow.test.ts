@@ -707,6 +707,71 @@ describe("CodexDiscordBot", () => {
     ]);
   });
 
+  it("posts compact success only after the app-server completion notification", async () => {
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const transport = new FakeAppServerTransport();
+    const codex = new AppServerCodexClient(transport);
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    const compactCommand = discord.emitMessage(message("message-1", "!compact"));
+    await flushAsyncProtocol();
+
+    expect(transport.sentRequests().at(-1)).toMatchObject({
+      method: "thread/compact/start",
+      params: { threadId: "thread-1" }
+    });
+    expect(discord.sentMessages).toEqual([]);
+
+    transport.emit({
+      method: "thread/compacted",
+      params: { threadId: "thread-1", turnId: "compact-turn-1" }
+    });
+
+    await compactCommand;
+    expect(discord.sentMessages).toEqual([
+      { channelId: "channel-1", content: "Compacted the conversation." }
+    ]);
+  });
+
+  it("reports compact timeout without posting success", async () => {
+    vi.useFakeTimers();
+    const dataDir = await tempDataDir();
+    const discord = new FakeDiscordGateway();
+    const transport = new FakeAppServerTransport();
+    const codex = new AppServerCodexClient(transport);
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    await new CodexDiscordBot(
+      configFor(dataDir),
+      discord,
+      codex,
+      new ThreadStateStore(dataDir)
+    ).start("gateway-auth-value");
+
+    const compactCommand = discord.emitMessage(message("message-1", "!compact"));
+    await flushAsyncProtocol();
+
+    expect(discord.sentMessages).toEqual([]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await compactCommand;
+
+    expect(consoleError).toHaveBeenCalled();
+    expect(discord.sentMessages).toEqual([
+      {
+        channelId: "channel-1",
+        content:
+          "Couldn't compact the conversation: Timed out waiting for Codex compaction to finish for thread thread-1"
+      }
+    ]);
+  });
+
   it("asks the operator to stop before compacting an active turn", async () => {
     const dataDir = await tempDataDir();
     const discord = new FakeDiscordGateway();
@@ -1037,6 +1102,12 @@ function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+async function flushAsyncProtocol(): Promise<void> {
+  for (let index = 0; index < 5; index += 1) {
+    await Promise.resolve();
+  }
 }
 
 class FakeDiscordGateway implements DiscordGateway {
