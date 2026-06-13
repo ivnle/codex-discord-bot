@@ -35,10 +35,7 @@ describe("AppServerCodexClient", () => {
     await expect(client.interrupt()).resolves.toBe(true);
     const compactPromise = client.compact(threadId);
     await flushAsyncProtocol();
-    transport.emit({
-      method: "thread/compacted",
-      params: { threadId, turnId: "compact-turn-1" }
-    });
+    transport.emitCompletedCompaction({ threadId });
     await compactPromise;
 
     expect(transport.started).toBe(true);
@@ -103,7 +100,8 @@ describe("AppServerCodexClient", () => {
     ]);
   });
 
-  it("waits for a matching thread/compacted notification before compact resolves", async () => {
+  it("waits for a matching contextCompaction item before compact resolves", async () => {
+    vi.useFakeTimers();
     const transport = new FakeAppServerTransport();
     const client = new AppServerCodexClient(transport);
     await client.connect();
@@ -126,12 +124,27 @@ describe("AppServerCodexClient", () => {
     });
     expect(settled).toBe(false);
 
-    transport.emit({
-      method: "thread/compacted",
-      params: { threadId: "thread-2", turnId: "compact-turn-2" }
+    transport.emitCompletedCompaction({
+      threadId: "thread-2",
+      turnId: "compact-turn-2"
     });
     await flushAsyncProtocol();
     expect(settled).toBe(false);
+
+    transport.emitCompletedCompaction({ threadId: "thread-1" });
+    await flushAsyncProtocol();
+
+    expect(settled).toBe(true);
+    await expect(compactPromise).resolves.toBeUndefined();
+  });
+
+  it("still resolves compact on deprecated thread/compacted notifications", async () => {
+    const transport = new FakeAppServerTransport();
+    const client = new AppServerCodexClient(transport);
+    await client.connect();
+
+    const compactPromise = client.compact("thread-1");
+    await flushAsyncProtocol();
 
     transport.emit({
       method: "thread/compacted",
@@ -139,7 +152,6 @@ describe("AppServerCodexClient", () => {
     });
 
     await expect(compactPromise).resolves.toBeUndefined();
-    expect(settled).toBe(true);
   });
 
   it("rejects compact when no matching completion notification arrives", async () => {

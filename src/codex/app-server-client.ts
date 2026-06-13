@@ -158,6 +158,11 @@ export class AppServerCodexClient implements CodexClient {
 
     if (message.method === "item/completed") {
       const item = asRecord(params.item);
+      if (item.type === "contextCompaction") {
+        this.resolveCompactWaiter(threadId);
+        return;
+      }
+
       if (
         item.type !== "agentMessage" ||
         item.phase !== "final_answer" ||
@@ -174,8 +179,7 @@ export class AppServerCodexClient implements CodexClient {
     }
 
     if (message.method === "thread/compacted") {
-      // This raw JSON-RPC client has no generated ContextCompaction item binding,
-      // so it uses the explicit completion notification from the app-server.
+      // Deprecated in newer codex app-servers, but harmless as a compatibility fallback.
       this.resolveCompactWaiter(threadId);
       return;
     }

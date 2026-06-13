@@ -36,6 +36,27 @@ export class FakeAppServerTransport implements JsonRpcTransport {
     this.handler?.(message);
   }
 
+  emitCompletedCompaction({
+    threadId,
+    turnId = "compact-turn-1"
+  }: {
+    threadId: string;
+    turnId?: string;
+  }): void {
+    this.emit({
+      method: "item/completed",
+      params: {
+        threadId,
+        turnId,
+        item: {
+          type: "contextCompaction",
+          id: "context-compaction-1"
+        },
+        completedAtMs: 1000
+      }
+    });
+  }
+
   emitCompletedTurn({
     threadId,
     turnId,

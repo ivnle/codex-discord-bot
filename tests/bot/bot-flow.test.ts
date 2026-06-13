@@ -728,10 +728,7 @@ describe("CodexDiscordBot", () => {
     });
     expect(discord.sentMessages).toEqual([]);
 
-    transport.emit({
-      method: "thread/compacted",
-      params: { threadId: "thread-1", turnId: "compact-turn-1" }
-    });
+    transport.emitCompletedCompaction({ threadId: "thread-1" });
 
     await compactCommand;
     expect(discord.sentMessages).toEqual([
