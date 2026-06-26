@@ -860,6 +860,8 @@ describe("CodexDiscordBot", () => {
           "`!compact` — compact the conversation (frees up context)\n" +
           "`!reset` / `!new` — start a fresh thread (clears history)\n" +
           "`!context` — show context-window usage\n" +
+          "`!model` — show the model and reasoning effort in use\n" +
+          "`!status` — show whether a turn is running and its progress\n" +
           "`!help` — show this help"
       }
     ]);

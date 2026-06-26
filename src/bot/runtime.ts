@@ -17,6 +17,8 @@ import { chunkReply } from "../replies/chunk.js";
 import type { ThreadStateStore } from "../state/thread-state.js";
 import { CliTranscriber, type Transcriber } from "../transcription/transcriber.js";
 import { formatContextUsage } from "./context-usage.js";
+import { formatModelInfo, readModelInfo } from "./model-info.js";
+import { formatTurnStatus, readTurnStatus } from "./turn-status.js";
 
 const TYPING_REFRESH_MS = 8000;
 const CONTROL_HELP =
@@ -25,9 +27,18 @@ const CONTROL_HELP =
   "`!compact` — compact the conversation (frees up context)\n" +
   "`!reset` / `!new` — start a fresh thread (clears history)\n" +
   "`!context` — show context-window usage\n" +
+  "`!model` — show the model and reasoning effort in use\n" +
+  "`!status` — show whether a turn is running and its progress\n" +
   "`!help` — show this help";
 
-type ControlCommand = "stop" | "compact" | "reset" | "context" | "help";
+type ControlCommand =
+  | "stop"
+  | "compact"
+  | "reset"
+  | "context"
+  | "model"
+  | "status"
+  | "help";
 
 interface QueuedMessage {
   message: DiscordMessage;
@@ -136,6 +147,23 @@ export class CodexDiscordBot {
         await this.discord.sendMessage(
           message.channelId,
           formatContextUsage(this.codex.getTokenUsage())
+        );
+        return;
+      case "model":
+        await this.discord.sendMessage(
+          message.channelId,
+          formatModelInfo(
+            await readModelInfo(this.threadId, this.config.codex.model)
+          )
+        );
+        return;
+      case "status":
+        await this.discord.sendMessage(
+          message.channelId,
+          formatTurnStatus(
+            await readTurnStatus(this.threadId, this.activeTurn),
+            Date.now()
+          )
         );
         return;
       case "help":
@@ -411,6 +439,10 @@ function parseControlCommand(content: string): ControlCommand | undefined {
       return "reset";
     case "!context":
       return "context";
+    case "!model":
+      return "model";
+    case "!status":
+      return "status";
     case "!help":
       return "help";
     default:
