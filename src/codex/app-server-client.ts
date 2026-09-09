@@ -34,11 +34,26 @@ export class AppServerCodexClient implements CodexClient {
   private readonly tokenUsageByThreadId = new Map<string, ThreadTokenUsage>();
   private currentThreadId: string | undefined;
   private currentTurnId: string | undefined;
+  private readonly eventHandlers: Array<(event: JsonRpcMessage) => void> = [];
+  private readonly disconnectHandlers: Array<() => void> = [];
 
   constructor(transport: JsonRpcTransport) {
     this.peer = new JsonRpcPeer(transport);
     this.peer.onNotification((message) => this.handleNotification(message));
     this.peer.onRequest((message) => this.handleServerRequest(message));
+    transport.onClose?.(() => this.disconnectHandlers.forEach((handler) => handler()));
+  }
+
+  onEvent(handler: (event: JsonRpcMessage) => void): void {
+    this.eventHandlers.push(handler);
+  }
+
+  onDisconnect(handler: () => void): void {
+    this.disconnectHandlers.push(handler);
+  }
+
+  async health(threadId: string): Promise<void> {
+    await this.peer.request("thread/read", { threadId, includeTurns: false });
   }
 
   async connect(): Promise<void> {
@@ -148,6 +163,7 @@ export class AppServerCodexClient implements CodexClient {
   }
 
   private handleNotification(message: JsonRpcMessage): void {
+    this.eventHandlers.forEach((handler) => handler(message));
     const params = asRecord(message.params);
     const threadId = typeof params.threadId === "string" ? params.threadId : "";
 
@@ -216,6 +232,7 @@ export class AppServerCodexClient implements CodexClient {
   }
 
   private handleServerRequest(message: JsonRpcMessage): void {
+    this.eventHandlers.forEach((handler) => handler(message));
     if (!message.method || !APPROVAL_REQUEST_METHODS.has(message.method)) {
       return;
     }
@@ -271,6 +288,7 @@ export class AppServerCodexClient implements CodexClient {
 function threadParams(options: CodexThreadOptions): Record<string, unknown> {
   return {
     cwd: options.cwd,
+    ...(options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}),
     ...(options.model ? { model: options.model } : {}),
     ...(options.sandbox ? { sandbox: options.sandbox } : {}),
     ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),

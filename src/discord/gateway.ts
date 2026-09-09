@@ -46,3 +46,20 @@ export interface DiscordGateway {
     prompt: DiscordPrompt
   ): Promise<void>;
 }
+
+export interface TaskCard {
+  content: string;
+  actions: Array<{ id: string; label: string }>;
+}
+
+export interface TaskAction {
+  id: string;
+  userId: string;
+  channelId: string;
+}
+
+export interface ConversationGateway extends DiscordGateway {
+  messagesAfter?(channelId:string, afterId:string):Promise<DiscordMessage[]>;
+  putStatus(channelId: string, messageId: string | undefined, card: TaskCard): Promise<string>;
+  onAction(handler: (action: TaskAction) => Promise<string>): void;
+}

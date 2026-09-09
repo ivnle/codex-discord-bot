@@ -12,6 +12,11 @@ export interface StdioJsonRpcTransportOptions {
 export class StdioJsonRpcTransport implements JsonRpcTransport {
   private child: ChildProcessWithoutNullStreams | undefined;
   private messageHandler: ((message: JsonRpcMessage) => void) | undefined;
+  private readonly closeHandlers: Array<() => void> = [];
+
+  onClose(handler: () => void): void {
+    this.closeHandlers.push(handler);
+  }
 
   constructor(
     private readonly command: string,
@@ -34,12 +39,27 @@ export class StdioJsonRpcTransport implements JsonRpcTransport {
       stdio: "pipe"
     });
     this.child = child;
+    // Drain stderr so a verbose worker cannot block on a full pipe. Never relay
+    // raw worker output (which can contain credentials) to Discord.
+    child.stderr.resume();
+    child.once("exit", () => {
+      if (this.child !== child) return;
+      this.child = undefined;
+      this.closeHandlers.forEach((handler) => handler());
+    });
+    child.on("error", () => {
+      if (this.child === child) this.closeHandlers.forEach((handler) => handler());
+    });
 
     createInterface({ input: child.stdout }).on("line", (line) => {
       if (!line.trim()) {
         return;
       }
-      this.messageHandler?.(JSON.parse(line) as JsonRpcMessage);
+      try {
+        this.messageHandler?.(JSON.parse(line) as JsonRpcMessage);
+      } catch {
+        child.kill("SIGTERM");
+      }
     });
 
     const [event] = await Promise.race([

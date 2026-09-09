@@ -8,6 +8,7 @@ export interface CodexTextInput {
 
 export interface CodexThreadOptions {
   cwd: string;
+  developerInstructions?: string;
   model?: string;
   sandbox?: SandboxMode;
   approvalPolicy?: ApprovalPolicy;
@@ -20,6 +21,7 @@ export interface CodexStartTurnRequest {
   cwd?: string;
   model?: string;
   approvalPolicy?: ApprovalPolicy;
+  outputSchema?: Record<string, unknown>;
 }
 
 export interface CodexFinalMessage {

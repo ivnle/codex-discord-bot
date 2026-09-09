@@ -9,6 +9,7 @@ export type JsonRpcMessage = {
 };
 
 export interface JsonRpcTransport {
+  onClose?(handler: () => void): void;
   onMessage(handler: (message: JsonRpcMessage) => void): void;
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -18,6 +19,7 @@ export interface JsonRpcTransport {
 type PendingRequest = {
   resolve: (result: unknown) => void;
   reject: (error: unknown) => void;
+  timeout: ReturnType<typeof setTimeout>;
 };
 
 export class JsonRpcPeer {
@@ -29,6 +31,7 @@ export class JsonRpcPeer {
 
   constructor(private readonly transport: JsonRpcTransport) {
     this.transport.onMessage((message) => this.handleMessage(message));
+    this.transport.onClose?.(() => this.rejectPending(new Error("Codex disconnected")));
   }
 
   async start(): Promise<void> {
@@ -36,6 +39,7 @@ export class JsonRpcPeer {
   }
 
   async stop(): Promise<void> {
+    this.rejectPending(new Error("Codex stopped"));
     await this.transport.stop();
   }
 
@@ -44,10 +48,30 @@ export class JsonRpcPeer {
     const message: JsonRpcMessage =
       params === undefined ? { id, method } : { id, method, params };
     const result = new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Codex did not respond to ${method}`));
+      }, 15000);
+      timeout.unref?.();
+      this.pending.set(id, { resolve, reject, timeout });
     });
-    await this.transport.send(message);
+    void this.transport.send(message).catch((error: unknown) => {
+      const pending = this.pending.get(id);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        this.pending.delete(id);
+        pending.reject(error);
+      }
+    });
     return result;
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 
   async respond(id: JsonRpcId, result: unknown): Promise<void> {
@@ -73,6 +97,7 @@ export class JsonRpcPeer {
         return;
       }
       this.pending.delete(message.id);
+      clearTimeout(pending.timeout);
       if (Object.hasOwn(message, "error")) {
         pending.reject(message.error);
         return;

@@ -19,6 +19,7 @@ import type {
   DiscordMessageHandler,
   DiscordPrompt
 } from "./gateway.js";
+import type { ConversationGateway, TaskAction, TaskCard } from "./gateway.js";
 
 const APPROVAL_CUSTOM_ID_PREFIX = "codex-approval";
 
@@ -111,9 +112,10 @@ export function parseApprovalCustomId(
   };
 }
 
-export class DiscordJsGateway implements DiscordGateway {
+export class DiscordJsGateway implements ConversationGateway {
   private readonly messageHandlers: DiscordMessageHandler[] = [];
   private readonly approvalHandlers: DiscordApprovalChoiceHandler[] = [];
+  private actionHandler?: (action: TaskAction) => Promise<string>;
 
   constructor(
     private readonly client = new Client({
@@ -127,10 +129,10 @@ export class DiscordJsGateway implements DiscordGateway {
     })
   ) {
     this.client.on(Events.MessageCreate, (message) => {
-      void this.handleMessage(message);
+      void this.handleMessage(message).catch(() => console.error("Discord message handling failed"));
     });
     this.client.on(Events.InteractionCreate, (interaction) => {
-      void this.handleInteraction(interaction);
+      void this.handleInteraction(interaction).catch(() => console.error("Discord interaction handling failed"));
     });
   }
 
@@ -152,6 +154,47 @@ export class DiscordJsGateway implements DiscordGateway {
 
   async sendMessage(channelId: string, content: string): Promise<void> {
     await this.sendToChannel(channelId, { content });
+  }
+
+  onAction(handler: (action: TaskAction) => Promise<string>): void {
+    this.actionHandler = handler;
+  }
+
+  async messagesAfter(channelId:string, afterId:string):Promise<DiscordMessage[]> {
+    const channel=await this.client.channels.fetch(channelId);
+    if(!channel?.isTextBased() || !("messages" in channel))throw new Error("Cannot read saved channel history.");
+    const result:DiscordMessage[]=[];
+    let before:string|undefined;
+    for(let page=0;page<100;page++) {
+      const batch=await channel.messages.fetch({limit:100,...(before?{before}:{})});
+      if(!batch.size) return result.sort((a,b)=>BigInt(a.id)<BigInt(b.id)?-1:1);
+      const sorted=[...batch.values()].sort((a,b)=>BigInt(a.id)<BigInt(b.id)?-1:1);
+      for(const raw of sorted) if(BigInt(raw.id)>BigInt(afterId)) {const message=toGatewayMessage(raw);if(message)result.push(message);}
+      before=sorted[0]!.id;
+      if(BigInt(before)<=BigInt(afterId) || batch.size<100)return result.sort((a,b)=>BigInt(a.id)<BigInt(b.id)?-1:1);
+    }
+    throw new Error("Too much channel history to recover automatically; Ivan needs to review missed requests.");
+  }
+
+  async putStatus(channelId: string, messageId: string | undefined, card: TaskCard): Promise<string> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel?.isTextBased() || !("send" in channel)) throw new Error("Channel unavailable");
+    const components = card.actions.length ? [new ActionRowBuilder<ButtonBuilder>().addComponents(
+      ...card.actions.map((action) => new ButtonBuilder()
+        .setCustomId(`ispy:${action.id}`).setLabel(action.label).setStyle(ButtonStyle.Secondary))
+    )] : [];
+    const payload = { content: card.content, components, allowedMentions: { parse: [] as [] } };
+    if (messageId) {
+      try {
+        const message = await channel.messages.fetch(messageId);
+        await message.edit(payload);
+        return message.id;
+      } catch (error) {
+        // Replace deleted cards; don't duplicate cards for transient failures.
+        if (!(typeof error === "object" && error !== null && "code" in error && error.code === 10008)) throw error;
+      }
+    }
+    return (await channel.send(payload)).id;
   }
 
   async sendTyping(channelId: string): Promise<void> {
@@ -212,6 +255,15 @@ export class DiscordJsGateway implements DiscordGateway {
       return;
     }
 
+    if (interaction.customId.startsWith("ispy:") && this.actionHandler && interaction.channelId) {
+      await interaction.deferReply({ ephemeral: true });
+      const response = await this.actionHandler({
+        id: interaction.customId.slice(5), userId: interaction.user.id, channelId: interaction.channelId
+      });
+      await interaction.editReply(response);
+      return;
+    }
+
     const parsed = parseApprovalCustomId(interaction.customId);
     if (!parsed) {
       return;
@@ -246,6 +298,6 @@ export class DiscordJsGateway implements DiscordGateway {
     ) {
       throw new Error(`Discord channel ${channelId} is not text based`);
     }
-    await (channel as SendableTextChannel).send(payload);
+    await (channel as SendableTextChannel).send({ ...payload, allowedMentions: { parse: [] } });
   }
 }
