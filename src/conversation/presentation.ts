@@ -16,6 +16,7 @@ export function taskCard(job: Job, now: number, connected: boolean): TaskCard {
   const actions: TaskCard["actions"] = [];
   if (["received", "queued", "working", "waiting", "checking", "publishing", "verifying"].includes(job.phase)) actions.push({ id: `stop:${job.id}`, label: "Stop" });
   if (job.phase === "interrupted") actions.push({ id: `retry:${job.id}`, label: "Retry" });
+  if (job.phase === "stopped" && job.sourceStart) actions.push({id:`retry:${job.id}`,label:"Resume"});
   if(job.releaseId && job.phase === "done") actions.push({id:`undo:${job.id}`,label:"Undo this change"});
   return { content: `**${titles[job.phase]}**\n${job.detail.slice(0, 1100)}${freshness}`, actions };
 }
@@ -31,24 +32,32 @@ Send brief commentary at meaningful milestones, describing actual activity, not 
 as accomplishments. The bridge handles acknowledgment and elapsed-time updates.
 If you need a clarification, prefer ending with needs_reply and one short question.
 You may also use request_user_input. Never request passwords or tokens in Discord.
-For a change, implement it, run appropriate checks and inspect the affected game
-in a phone-sized browser when tools permit. Explain any checks you could not run.
-A trusted controller automatically checks and publishes completed changes. Never deploy,
-push, merge, change credentials, commit, or claim a change is live yourself. Finish
-with a concise description of the prepared change; the controller confirms publishing.
+For a change, implement it and run focused checks when useful. The trusted controller
+runs the required full verification and phone-browser checks, then publishes.
+Do not run the entire verify suite yourself or report your sandbox's unavailable
+browser as a release failure; the controller has a separate checking environment.
+Never deploy, push, merge, change credentials, commit, or claim a change is live
+yourself. Finish with a concise description of the prepared change. The controller
+supplies the final publishing confirmation. For follow-up questions, use the trusted
+controller status supplied with the parent's message; earlier coding replies may
+predate publishing. There is no preview-deployment step for the parent to manage.
 You can fix bugs, extend games, and create new games within src/games plus register
 them in src/app/games.ts. Keep existing games and routes. Existing tests, package and
 build settings, deployment files, service workers, platform code and saved-game storage
 are protected. If a change needs these, explain what needs Ivan's review and end
-needs_reply; do not bypass the restriction or weaken checks. New games need their own
+needs_review; do not bypass the restriction or weaken checks. New games need their own
 release-checks/<game-id>.json: {"game":"Exact tile label","steps":[{"action":"click",
 "selector":"a meaningful gameplay control CSS selector"},{"action":"expectVisible",
 "selector":"CSS selector for the resulting game state"}]}. Check a real interaction,
 not just whether the page exists. Don't modify existing games' storage formats; new
 games needing persisted storage should get Ivan's review of the storage design.
 When checks fail the controller gives you the failure and up to two repair attempts.
+Repairs must stay within the original request and originally changed files. Never
+fix an unrelated game merely to make a check pass; request owner review if broader
+work is needed. A timing-sensitive failure may be retried without changing code.
 Return the final JSON schema: message is the human-readable answer; state is
-needs_reply only when you need an answer, otherwise done. Keep links in message.
+needs_review when a protected change needs Ivan; needs_reply when the parent can
+answer a question; otherwise done. Keep links in message.
 If resuming after an interruption, inspect actual files and completed work first;
 never assume the previous attempt did nothing.`;
 
@@ -56,6 +65,6 @@ export const RESULT_SCHEMA = {
   type: "object", additionalProperties: false, required: ["message", "state"],
   properties: {
     message: { type: "string" },
-    state: { type: "string", enum: ["done", "needs_reply"] }
+    state: { type: "string", enum: ["done", "needs_reply", "needs_review"] }
   }
 };

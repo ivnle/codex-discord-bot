@@ -173,8 +173,8 @@ export class FamilyConversation {
     for (const old of this.state.jobs.filter((j) => j.phase === "waiting" && j.result)) {
       old.phase = "done"; old.detail = "Answer received."; await this.saveAndPaint(old);
     }
-    const unfinished = !this.active ? [...this.state.jobs].reverse().find(j=>!j.resolvedBy && ["stopped","interrupted","review"].includes(j.phase)) : undefined;
-    if(unfinished && this.releases) {
+    const unfinished = !this.active ? [...this.state.jobs].reverse().find(j=>!j.resolvedBy && (j.started || j.turnId || j.phase === "review") && ["stopped","interrupted","review"].includes(j.phase)) : undefined;
+    if(unfinished && this.releases && (await this.releases.hasChanges?.() ?? true)) {
       message={...message,content:`There may be saved unfinished edits from this earlier request: ${unfinished.message.content}\nNew message from the parent: ${message.content}\nInspect the saved work. If this is an unrelated new request, ask whether to continue or set aside the previous edits before changing anything; never silently publish abandoned edits.`};
     }
     const job: Job = {
@@ -197,13 +197,19 @@ export class FamilyConversation {
       await this.saveAndPaint(job); return;
     }
     this.active = job;
+    job.started = true;
     job.phase = "working"; job.detail = "Looking at your request."; job.activity = this.now();
     await this.saveAndPaint(job);
     try {
+      if (!job.sourceStart && this.releases?.checkpoint) {
+        job.sourceStart = await this.releases.checkpoint();
+        await this.store.save(this.state);
+      }
+      const releaseStatus = await this.releases?.status?.();
       await this.codex.startTurn({
         threadId: this.state.threadId!, clientUserMessageId: randomUUID(),
         cwd: this.config.codex.cwd,
-        input: [{ type: "text", text: job.message.content, text_elements: [] }],
+        input: [{ type: "text", text: releaseStatus ? `${releaseStatus}\n\nParent message:\n${job.message.content}` : job.message.content, text_elements: [] }],
         outputSchema: RESULT_SCHEMA,
       });
     } catch {
@@ -258,6 +264,7 @@ export class FamilyConversation {
           const result = parseResult(item.text);
           job.result = result.message;
           job.needsReply = result.needsReply;
+          job.needsReview = result.needsReview;
           await this.store.save(this.state);
         } else if (job.phase === "working") {
           job.detail = item.text.slice(0, 1100); this.dirty.add(job.id);
@@ -273,18 +280,34 @@ export class FamilyConversation {
     if (event.method === "turn/completed") {
       const failed = turn.status === "failed";
       const stopped = turn.status === "interrupted" || job.phase === "stopping";
-      if (!failed && !stopped && !job.needsReply && job.result && this.releases) {
-        this.startRelease(job); return;
+      if (!failed && !stopped && !job.needsReply && !job.needsReview && job.result && this.releases) {
+        let publish = true;
+        if (this.releases.checkpoint) {
+          try {
+            const current = await this.releases.checkpoint();
+            const start = job.sourceStart;
+            publish = !!start && current.tree !== start.tree;
+            if (!start || (publish && (start.tree !== start.baseline || current.baseline !== start.baseline))) {
+              publish = false; job.needsReview = true;
+              job.result = "There are unfinished edits from another request, or the live version changed. Nothing was published. Ivan needs to review the saved work before continuing.";
+            }
+          } catch {
+            publish = false; job.needsReview = true;
+            job.result = "I couldn't verify which edits belong to this request. Nothing was published. Ivan needs to review the saved work.";
+          }
+        }
+        if (publish) { this.startRelease(job); return; }
       }
-      job.phase = failed ? "interrupted" : stopped ? "stopped" : job.needsReply ? "waiting" : "done";
+      job.phase = failed ? "interrupted" : stopped ? "stopped" : job.needsReview ? "review" : job.needsReply ? "waiting" : "done";
       job.detail = failed ? "The agent couldn't finish this request. Tap Retry to continue from the saved work."
         : stopped ? "Stopped. Any edits already made are kept; nothing was published by stopping."
+        : job.needsReview ? "This change needs Ivan’s review before it can proceed."
         : job.needsReply ? "Waiting for your answer to the question below."
         : "Finished. Ready for your next idea.";
       if (!failed && !stopped && !job.result) {
         job.phase = "interrupted"; job.detail = "The agent ended without a reply. Tap Retry to check what happened.";
       }
-      if (failed || stopped) { job.result = undefined; job.needsReply = false; }
+      if (failed || stopped) { job.result = undefined; job.needsReply = false; job.needsReview = false; }
       this.active = undefined; this.pendingInput = undefined; this.approvals.clear();
       await this.saveAndPaint(job);
       await this.deliver(job);
@@ -307,7 +330,7 @@ export class FamilyConversation {
           if(previous.created <= job.created && ["stopped","interrupted","review"].includes(previous.phase)) previous.resolvedBy=job.id;
         }
         job.detail=outcome.published ? "Live and checked. Ready for your next idea." : "Finished. Ready for your next idea.";
-        if(outcome.message) job.result=`${job.result}\n\n${outcome.message}`;
+        if(outcome.message) job.result=outcome.message;
         this.active=undefined; this.releaseAbort=undefined;
         await this.saveAndPaint(job); await this.deliver(job); await this.pump();
       }),
@@ -318,8 +341,8 @@ export class FamilyConversation {
           job.repairs=(job.repairs ?? 0)+1; job.turnId=undefined; job.result=undefined;
           job.phase="working"; job.detail="A check found a problem. Fixing it before publishing.";
           await this.saveAndPaint(job);
-          try { await this.codex.startTurn({threadId:this.state.threadId!,clientUserMessageId:randomUUID(),cwd:this.config.codex.cwd,
-            input:[{type:"text",text:`The trusted release controller did not publish your changes. Repair the failure without changing protected checks, storage, dependencies, or deployment machinery. Do not claim it is live. Failure:\n${String(error).slice(-6500)}`,text_elements:[]}],outputSchema:RESULT_SCHEMA}); }
+          try { const repairContext=await this.releases?.repairContext?.(job.id); await this.codex.startTurn({threadId:this.state.threadId!,clientUserMessageId:randomUUID(),cwd:this.config.codex.cwd,
+            input:[{type:"text",text:`The trusted release controller did not publish your changes. Original parent request: ${job.message.content}\n${repairContext ?? "Preserve the original request scope."}\nRepair without changing protected checks, storage, dependencies, or deployment machinery. If a failure is in an unrelated game or looks timing-sensitive, do not edit that game: keep the requested change and let the controller retry the unchanged candidate. If a broader repair is necessary, ask for owner review. Do not claim it is live. Failure:\n${String(error).slice(-6500)}`,text_elements:[]}],outputSchema:RESULT_SCHEMA}); }
           catch { await this.codex.stop?.(); await this.disconnect(); }
           return;
         }
@@ -356,7 +379,7 @@ export class FamilyConversation {
       return "Undo received. I'll confirm when the previous version is restored.";
     }
     if (verb === "stop") { await this.stopJob(job); return job.phase === "stopping" ? "Stopping now…" : "Stopped, or already finished."; }
-    if (verb === "retry" && job.phase === "interrupted") {
+    if (verb === "retry" && (job.phase === "interrupted" || (job.phase === "stopped" && !!job.sourceStart))) {
       if (this.active) return "Please wait for the current request, or stop it first.";
       if (!this.connected) {
         try { await this.codex.stop?.(); await this.connect(); }
@@ -364,7 +387,7 @@ export class FamilyConversation {
       }
       // Disconnect notifications from the old transport must be processed before
       // reconnect; adapters identify stale process closures separately.
-      job.turnId = undefined; job.result = undefined; job.needsReply = false; job.deliveredChunks = 0;
+      job.turnId = undefined; job.result = undefined; job.needsReply = false; job.needsReview = false; job.deliveredChunks = 0;
       job.phase = "received"; job.detail = "Got it. I'll inspect the saved work and continue.";
       job.message.content = `Continue this request after an interruption. Inspect existing changes before doing more work.\n\n${job.message.content}`;
       await this.saveAndPaint(job); await this.pump(); return "Retry received.";
@@ -419,7 +442,7 @@ export class FamilyConversation {
     } catch { console.error("Status delivery failed; will retry"); }
   }
   private async deliver(job: Job): Promise<void> {
-    if (!job.result || !["done", "waiting"].includes(job.phase)) return;
+    if (!job.result || !["done", "waiting", "review"].includes(job.phase)) return;
     const chunks = chunkReply(job.result);
     while (job.deliveredChunks < chunks.length) {
       try {
@@ -467,13 +490,13 @@ export class FamilyConversation {
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
 }
-export function parseResult(text: string): { message: string; needsReply: boolean } {
+export function parseResult(text: string): { message: string; needsReply: boolean; needsReview:boolean } {
   try {
     const value = JSON.parse(text) as unknown;
     const result = record(value);
-    if (typeof result.message === "string" && ["done", "needs_reply"].includes(String(result.state))) {
-      return { message: result.message, needsReply: result.state === "needs_reply" };
+    if (typeof result.message === "string" && ["done", "needs_reply", "needs_review"].includes(String(result.state))) {
+      return { message: result.message, needsReply: result.state === "needs_reply", needsReview:result.state === "needs_review" };
     }
   } catch { /* Older models may answer in plain text. */ }
-  return { message: text, needsReply: false };
+  return { message: text, needsReply: false, needsReview:false };
 }

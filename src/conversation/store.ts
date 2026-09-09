@@ -15,9 +15,12 @@ export interface Job {
   repairs?: number;
   resolvedBy?: string;
   undoing?: boolean;
+  started?: boolean;
+  sourceStart?: {tree:string; baseline:string};
   cardId?: string;
   result?: string;
   needsReply?: boolean;
+  needsReview?: boolean;
   deliveredChunks: number;
 }
 export interface ConversationState {

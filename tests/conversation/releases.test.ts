@@ -95,3 +95,26 @@ it('refuses a second publisher even when it runs in the same process',async()=>{
  const second=new ReleaseController({dir} as ReleaseConfig);
  await expect(second.recover()).rejects.toThrow('Another release controller');
 });
+
+it('locks repair scope to the files in the first prepared candidate',async()=>{
+ const {controller}=await setup({current:{commit:'base',deployment:'old'}});
+ controller.git=vi.fn(async()=> 'src/games/pizza/pizza.css');
+ await controller.enforceRequestScope('job','tree','base');
+ await expect(controller.enforceRequestScope('job','another-tree','base')).resolves.toBeUndefined();
+ controller.git=vi.fn(async()=> 'src/games/pizza/pizza.css\nsrc/games/potty-time/PottyTimeGame.tsx');
+ await expect(controller.enforceRequestScope('job','broader-tree','base')).rejects.toThrow('expanded beyond');
+ expect(await controller.repairContext('job')).toContain('src/games/pizza/pizza.css');
+ await expect(controller.enforceRequestScope('job','tree','different-base')).rejects.toThrow('expanded beyond');
+});
+
+it('cancels detached test descendants instead of hanging on inherited output pipes',async()=>{
+ const {command}=await import('../../src/releases/controller.js');
+ const dir=await mkdtemp(path.join(os.tmpdir(),'gengar-cancel-test-'));dirs.push(dir);
+ const script=path.join(dir,'runner.mjs');const ready=path.join(dir,'ready');
+ await writeFile(script,`import {spawn} from 'node:child_process';import {writeFileSync} from 'node:fs';const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'inherit'});writeFileSync(${JSON.stringify(ready)},String(c.pid));setInterval(()=>{},1000);`);
+ const abort=new AbortController();const task=command(process.execPath,[script],dir,{signal:abort.signal});
+ const result=expect(task).rejects.toThrow('Stopped before publishing');
+ let pid=0;for(let i=0;i<100;i++){try{pid=Number(await readFile(ready,'utf8'));break;}catch{await new Promise(r=>setTimeout(r,20));}}
+ expect(pid).toBeGreaterThan(0);abort.abort();await result;
+ await new Promise(r=>setTimeout(r,50));expect(()=>process.kill(pid,0)).toThrow();
+},5000);

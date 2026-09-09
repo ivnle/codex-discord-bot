@@ -114,7 +114,7 @@ describe("automatic releases in Discord",()=>{
     expect([...h.cards.values()][0]!.content).toContain("Checking");
     finish({published:true,id:"release-1",message:"Verified live version"});
     await new Promise(r=>setTimeout(r,10));await h.bot.settled();
-    expect(h.replies).toEqual(["All done\n\nVerified live version"]);expect(h.turns).toHaveLength(2);
+    expect(h.replies).toEqual(["Verified live version"]);expect(h.turns).toHaveLength(2);
     expect([...h.cards.values()][0]!.actions.some(a=>a.label==="Undo this change")).toBe(true);
   });
   it("Stop aborts checking without interrupting an already finished Codex turn",async()=>{
@@ -143,4 +143,49 @@ it("recovers an offline message once even when it also arrives during connection
  const message={id:"101",authorId:"wife",channelId:"game",content:"A saved request",isDirectMessage:false,attachments:[]};
  const h=await setup(undefined,[message]);
  expect(h.turns).toHaveLength(1);expect(h.cards.size).toBe(1);expect(JSON.stringify(h.turns[0])).toContain("A saved request");
+});
+
+it("does not expose an outdated coding draft in a verified release reply",async()=>{
+ const service={recover:async()=>{},undo:async()=>"restored",status:async()=>"Trusted status: last change published.",release:async()=>({published:true,id:"version",message:"Verified live. Refresh the game."})};
+ const h=await setup(service);await h.send();
+ expect(JSON.stringify(h.turns[0])).toContain("Trusted status: last change published.");
+ await h.emit("item/completed",{turnId:"t1",item:{type:"agentMessage",phase:"final_answer",text:JSON.stringify({message:"Browser blocked. Nothing was published; no preview is available.",state:"done"})}});
+ await h.emit("turn/completed",{turn:{id:"t1",status:"completed"}});await new Promise(r=>setTimeout(r,10));await h.bot.settled();
+ expect(h.replies).toEqual(["Verified live. Refresh the game."]);
+});
+it("does not treat a cancelled queued request as unfinished edits",async()=>{
+ const service={recover:async()=>{},undo:async()=>"restored",release:async()=>({published:false})};
+ const h=await setup(service);await h.send("first");await h.send("cancelled second");
+ const stop=[...h.cards.values()][1]!.actions.find(a=>a.label==="Stop")!;
+ await h.action({id:stop.id,userId:"wife",channelId:"game"});await h.complete();await new Promise(r=>setTimeout(r,10));await h.bot.settled();
+ await h.send("unrelated question");expect(JSON.stringify(h.turns.at(-1))).not.toContain("cancelled second");
+});
+
+it("distinguishes owner review from a question for the parent",async()=>{
+ let releases=0;const service={recover:async()=>{},undo:async()=>"restored",hasChanges:async()=>false,release:async()=>{releases++;return {published:false};}};
+ const h=await setup(service);await h.send("change protected storage");await h.complete("t1","needs_review");
+ expect(releases).toBe(0);expect([...h.cards.values()][0]!.content).toContain("Ivan");expect(h.replies).toEqual(["All done"]);
+ await h.send("ordinary question");expect(JSON.stringify(h.turns.at(-1))).not.toContain("saved unfinished edits");
+});
+
+it.each([
+ ['dirty','dirty',false,false],
+ ['dirty','new',false,true],
+ ['base','new',true,false],
+ ['base','base',false,false],
+] as const)('request checkpoint %s -> %s prevents inherited publication',async(start,end,published,review)=>{
+ let tree:string=start;let calls=0;
+ const h=await setup({recover:async()=>{},undo:async()=>'',checkpoint:async()=>({tree,baseline:'base'}),release:async()=>{calls++;return {published:true,message:'Verified live'};}});
+ await h.send('current request');tree=end;await h.complete();await h.bot.settled();
+ expect(calls).toBe(published?1:0);
+ expect([...h.cards.values()][0]!.content.includes('Ivan’s review')).toBe(review);
+});
+it('explicit Resume retains ownership of a stopped request',async()=>{
+ let tree='base';let calls=0;
+ const h=await setup({recover:async()=>{},undo:async()=>'',checkpoint:async()=>({tree,baseline:'base'}),release:async()=>{calls++;return {published:true,message:'Verified live'};}});
+ await h.send('lavender');tree='lavender';
+ await h.action({id:[...h.cards.values()][0]!.actions[0]!.id,userId:'wife',channelId:'game'});
+ await h.emit('turn/completed',{turn:{id:'t1',status:'interrupted'}});
+ const resume=[...h.cards.values()][0]!.actions.find(a=>a.label==='Resume')!;
+ await h.action({id:resume.id,userId:'wife',channelId:'game'});await h.complete('t2');await h.bot.settled();expect(calls).toBe(1);
 });

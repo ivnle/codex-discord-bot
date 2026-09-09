@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { createWriteStream } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, writeFile, rename, cp, rm, lstat, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -12,6 +12,10 @@ export interface ReleaseOutcome { published: boolean; id?: string; message?: str
 export interface ReleaseService {
   recover(): Promise<void>;
   completed?(jobId:string): Promise<ReleaseOutcome | undefined>;
+  status?(): Promise<string>;
+  hasChanges?(): Promise<boolean>;
+  checkpoint?(): Promise<{tree:string; baseline:string}>;
+  repairContext?(jobId:string): Promise<string>;
   release(jobId: string, update: (phase: ReleasePhase, detail: string) => Promise<void>, signal: AbortSignal): Promise<ReleaseOutcome>;
   undo(id: string, update: (phase: ReleasePhase, detail: string) => Promise<void>): Promise<string>;
 }
@@ -24,7 +28,18 @@ export async function command(command: string, args: string[], cwd: string, opti
   return new Promise((resolve, reject) => {
     let output = ""; let overflow=false;
     const child = spawn(command, args, { cwd, env: options.env ?? cleanEnv(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    const kill = () => { try { process.kill(-child.pid!, "SIGKILL"); } catch {} };
+    const kill = () => {
+      // Gameplay runners create detached groups. Stop descendants before their
+      // parent so orphaned preview servers cannot retain the output pipes.
+      const descendants:number[]=[];
+      try {
+        const rows=execFileSync("/bin/ps",["-axo","pid=,ppid="],{encoding:"utf8"}).trim().split("\n").map(row=>row.trim().split(/\s+/).map(Number));
+        const collect=(parent:number)=>{for(const [pid,ppid] of rows)if(ppid===parent && pid){descendants.push(pid);collect(pid);}};
+        if(child.pid)collect(child.pid);
+      } catch {}
+      for(const pid of descendants.reverse()) {try{process.kill(-pid,"SIGKILL");}catch{} try{process.kill(pid,"SIGKILL");}catch{}}
+      try { process.kill(-child.pid!, "SIGKILL"); } catch {}
+    };
     const timer = setTimeout(kill, options.timeout ?? 25 * 60_000);
     options.signal?.addEventListener("abort", kill, { once: true });
     if (options.signal?.aborted) kill();
@@ -119,6 +134,18 @@ export class ReleaseController implements ReleaseService {
     // Keep candidate work for repair, but never label an unverified upload live.
     delete j.pending; await this.save(j);
   }
+  async checkpoint():Promise<{tree:string;baseline:string}> {
+    const j=await this.journal();
+    return {tree:await this.snapshot(),baseline:await this.git(["rev-parse",`${j.current.commit}^{tree}`])};
+  }
+  async hasChanges():Promise<boolean> {
+    const j=await this.journal();
+    return await this.snapshot() !== await this.git(["rev-parse",`${j.current.commit}^{tree}`]);
+  }
+  async status():Promise<string> {
+    const j=await this.journal();
+    return `Trusted release controller status: ${j.current.release ? `A published version was verified at ${this.config.origin}. ${j.latest?.id === j.current.release ? "The latest change can be undone with its Discord Undo control." : "The most recent change has already been undone; no further Undo is available."}` : `The game is on its baseline version at ${this.config.origin}; there is no new published change to undo.`} ${j.pending ? "A release transaction still needs reconciliation." : "No publishing transaction is pending."} The coding agent's earlier statements about not publishing describe its own turn, not the controller's later result. Use this controller status when answering publication questions; do not quote internal version IDs.`;
+  }
   async completed(jobId:string):Promise<ReleaseOutcome|undefined> {
     const j=await this.journal();
     if(j.pending || !j.current.release?.startsWith(`${jobId}-`))return;
@@ -152,6 +179,26 @@ export class ReleaseController implements ReleaseService {
     const entries = await this.git(["ls-tree", "-r", tree]);
     if (entries.split("\n").some(l => /^(120000|160000) /.test(l))) throw new ReviewRequired("Symlinks and submodules aren't allowed in automatic releases.");
   }
+  private async enforceRequestScope(jobId:string, tree:string, base:string):Promise<void> {
+    if(!/^[a-zA-Z0-9-]+$/.test(jobId))throw new ReviewRequired("Invalid request identity.");
+    const files=(await this.git(["diff-tree","--no-commit-id","--name-only","-r","--no-renames",base,tree])).split("\n").filter(Boolean);
+    const dir=path.join(this.config.dir,"request-scopes");await mkdir(dir,{recursive:true,mode:0o700});
+    const file=path.join(dir,jobId+".json");
+    let scope:{base:string;files:string[]};
+    try{scope=JSON.parse(await readFile(file,"utf8"));}
+    catch(e){
+      if((e as NodeJS.ErrnoException).code!=="ENOENT")throw e;
+      await writeFile(file,JSON.stringify({base,files},null,2),{flag:"wx",mode:0o600});return;
+    }
+    const extra=files.filter(f=>!scope.files.includes(f));
+    if(scope.base!==base || extra.length)throw new ReviewRequired(`The repair expanded beyond the original change${extra.length ? ` (${extra.join(", ")})` : ""}. Ivan needs to review the scope; nothing was published.`);
+  }
+  async repairContext(jobId:string):Promise<string> {
+    try {
+      const scope=JSON.parse(await readFile(path.join(this.config.dir,"request-scopes",jobId+".json"),"utf8")) as {files:string[]};
+      return `The controller only permits repairs in these originally changed files: ${scope.files.join(", ")}. Expanding to another file requires owner review.`;
+    }catch(e){if((e as NodeJS.ErrnoException).code!=="ENOENT")throw e;return "Preserve the original request's scope.";}
+  }
   async release(jobId: string, update: (p: ReleasePhase, d: string) => Promise<void>, signal: AbortSignal): Promise<ReleaseOutcome> {
     await this.acquire();
     if (this.busy) throw new Error("A release is already running.");
@@ -164,6 +211,7 @@ export class ReleaseController implements ReleaseService {
       if (tree === await this.git(["rev-parse", `${j.current.commit}^{tree}`])) return {published:false};
       await update("checking", "Checking the changes, all existing games, offline play, and saved creations. This usually takes several minutes.");
       await this.guard(tree, j.current.commit);
+      await this.enforceRequestScope(jobId,tree,j.current.commit);
       const id = `${jobId}-${Date.now()}`;
       const root = path.join(this.config.dir, "releases", id);
       const source = path.join(root, "source");
