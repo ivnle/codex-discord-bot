@@ -118,3 +118,9 @@ it('cancels detached test descendants instead of hanging on inherited output pip
  expect(pid).toBeGreaterThan(0);abort.abort();await result;
  await new Promise(r=>setTimeout(r,50));expect(()=>process.kill(pid,0)).toThrow();
 },5000);
+
+it('reports a bounded command timeout as unavailable instead of a code repair',async()=>{
+ const {command}=await import('../../src/releases/controller.js');
+ const {CheckUnavailable}=await import('../../src/releases/policy.js');
+ await expect(command(process.execPath,['-e','setInterval(()=>{},1000)'],os.tmpdir(),{timeout:100})).rejects.toBeInstanceOf(CheckUnavailable);
+});

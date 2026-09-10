@@ -13,7 +13,14 @@ export interface Job {
   turnId?: string;
   releaseId?: string;
   repairs?: number;
+  checkAttempts?: number;
+  retryCheckpoint?: {tree:string; baseline:string};
   resolvedBy?: string;
+  supersededBy?: string;
+  continuesDraft?: boolean;
+  earlyReply?: string;
+  earlyDeliveredChunks?: number;
+  preview?: {id:string;url:string;tree:string};
   undoing?: boolean;
   started?: boolean;
   sourceStart?: {tree:string; baseline:string};

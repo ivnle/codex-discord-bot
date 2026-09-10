@@ -1,5 +1,5 @@
-import type { ReleaseService, ReleasePhase } from "../releases/controller.js";
-import { ReviewRequired } from "../releases/policy.js";
+import type { ReleaseService, ReleasePhase, DraftPreview } from "../releases/controller.js";
+import { ReviewRequired, CheckUnavailable } from "../releases/policy.js";
 import { randomUUID } from "node:crypto";
 import type { BotConfig } from "../config/types.js";
 import type { CodexClient, CodexRpcId } from "../codex/client.js";
@@ -170,7 +170,9 @@ export class FamilyConversation {
       return;
     }
     // An ordinary follow-up resolves a prior conversational question.
+    let discussion:Job|undefined;
     for (const old of this.state.jobs.filter((j) => j.phase === "waiting" && j.result)) {
+      if(old.continuesDraft && old.sourceStart)discussion=old;
       old.phase = "done"; old.detail = "Answer received."; await this.saveAndPaint(old);
     }
     const unfinished = !this.active ? [...this.state.jobs].reverse().find(j=>!j.resolvedBy && (j.started || j.turnId || j.phase === "review") && ["stopped","interrupted","review"].includes(j.phase)) : undefined;
@@ -182,13 +184,34 @@ export class FamilyConversation {
       detail: this.active ? "Got it—I'll handle this after the current request." : "Got it. Your request is saved.",
       created: this.now(), activity: this.now(), deliveredChunks: 0,
     };
+    if(discussion){
+      job.sourceStart={...discussion.sourceStart!};job.continuesDraft=true;
+      job.message={...job.message,content:`Continue the unpublished draft and prior discussion: ${discussion.message.content}\nParent answer: ${message.content}\nPreserve authorized draft edits. Do not treat a question as a request for extra changes.`};
+      discussion.resolvedBy=job.id;
+    }
+    // A response to an available draft replaces that unpublished iteration.
+    // Stop its isolated checks before letting Codex touch the workspace again.
+    const draft=this.active;
+    if(draft?.phase==="checking" && draft.preview && draft.sourceStart && this.releaseAbort) {
+      await this.replaceDraft(draft,job);
+    }
     this.state.jobs.push(job);
     await this.saveAndPaint(job); // Receipt must be durable before a worker starts.
     await this.pump();
   }
 
+  private async replaceDraft(draft:Job,next:Job):Promise<void> {
+    next.sourceStart={...draft.sourceStart!};
+    next.continuesDraft=true;
+    next.message={...next.message,content:`Continue discussing or refining this unpublished draft. Original request and follow-ups: ${draft.message.content}\nLatest parent message: ${next.message.content}\nThe controller paused full testing. Preserve the existing authorized draft edits. Answer questions without inventing changes; revise only when asked. The controller will resume checks after your reply unless you need clarification or owner review.`};
+    draft.supersededBy=next.id;draft.resolvedBy=next.id;draft.phase="stopping";
+    draft.detail="Pausing this draft's checks to handle your follow-up.";
+    this.releaseAbort?.abort();
+    await this.saveAndPaint(draft);
+  }
+
   private async pump(): Promise<void> {
-    if (this.active || this.closing || !this.ready) return;
+    if (this.active || this.releaseTask || this.closing || !this.ready) return;
     const job = this.state.jobs.find((j) => j.phase === "received" || j.phase === "queued");
     if (!job || !job.cardId) return;
     if (!this.connected) {
@@ -296,7 +319,10 @@ export class FamilyConversation {
             job.result = "I couldn't verify which edits belong to this request. Nothing was published. Ivan needs to review the saved work.";
           }
         }
-        if (publish) { this.startRelease(job); return; }
+        if (publish) {
+          if(job.continuesDraft && !job.earlyReply){job.earlyReply=job.result;job.earlyDeliveredChunks=0;await this.store.save(this.state);await this.deliver(job);}
+          this.startRelease(job); return;
+        }
       }
       job.phase = failed ? "interrupted" : stopped ? "stopped" : job.needsReview ? "review" : job.needsReply ? "waiting" : "done";
       job.detail = failed ? "The agent couldn't finish this request. Tap Retry to continue from the saved work."
@@ -319,11 +345,26 @@ export class FamilyConversation {
 
   private startRelease(job: Job): void {
     job.phase="checking";
+    job.checkAttempts=(job.checkAttempts ?? job.repairs ?? 0)+1;
+    job.retryCheckpoint=undefined;
+    job.preview=undefined;
     this.releaseAbort = new AbortController();
-    const update = (phase: ReleasePhase, detail: string) => this.enqueue(async () => {
-      job.phase=phase; job.detail=detail; job.activity=this.now(); await this.saveAndPaint(job);
+    const update = (phase: ReleasePhase, detail: string, preview?:DraftPreview) => this.enqueue(async () => {
+      if(job.supersededBy)return;
+      if(preview)job.preview=preview;
+      job.phase=phase; job.detail=`Attempt ${job.checkAttempts}: ${detail}`; job.activity=this.now(); await this.saveAndPaint(job);
+      if(phase==="checking" && preview && job.sourceStart) {
+        const next=this.state.jobs.find(j=>j.phase==="queued" || j.phase==="received");
+        if(next){await this.replaceDraft(job,next);await this.saveAndPaint(next);}
+      }
     });
-    this.releaseTask = this.releases!.release(job.id, update, this.releaseAbort.signal).then(
+    let candidate: {tree:string; baseline:string} | undefined;
+    const signal=this.releaseAbort.signal;
+    const run=async()=>{
+      candidate=await this.releases!.checkpoint?.();
+      return this.releases!.release(job.id, update, signal);
+    };
+    this.releaseTask = run().then(
       outcome => this.enqueue(async () => {
         job.phase="done"; job.releaseId=outcome.id;
         for(const previous of this.state.jobs) {
@@ -335,23 +376,33 @@ export class FamilyConversation {
         await this.saveAndPaint(job); await this.deliver(job); await this.pump();
       }),
       error => this.enqueue(async () => {
-        const cancelled=this.releaseAbort?.signal.aborted;
+        const cancelled=signal.aborted;
         this.releaseAbort=undefined;
-        if(!cancelled && !(error instanceof ReviewRequired) && (job.repairs ?? 0)<2 && !this.closing) {
+        if(job.supersededBy) {
+          job.phase="stopped";job.detail="Replaced by your follow-up. This draft was not published.";job.result=undefined;
+          this.active=undefined;await this.saveAndPaint(job);return;
+        }
+        if(!cancelled && !(error instanceof ReviewRequired) && !(error instanceof CheckUnavailable) && (job.repairs ?? 0)<2 && !this.closing) {
           job.repairs=(job.repairs ?? 0)+1; job.turnId=undefined; job.result=undefined;
           job.phase="working"; job.detail="A check found a problem. Fixing it before publishing.";
           await this.saveAndPaint(job);
-          try { const repairContext=await this.releases?.repairContext?.(job.id); await this.codex.startTurn({threadId:this.state.threadId!,clientUserMessageId:randomUUID(),cwd:this.config.codex.cwd,
+          try { if(!this.connected) {await this.codex.stop?.();await this.connect();} const repairContext=await this.releases?.repairContext?.(job.id); await this.codex.startTurn({threadId:this.state.threadId!,clientUserMessageId:randomUUID(),cwd:this.config.codex.cwd,
             input:[{type:"text",text:`The trusted release controller did not publish your changes. Original parent request: ${job.message.content}\n${repairContext ?? "Preserve the original request scope."}\nRepair without changing protected checks, storage, dependencies, or deployment machinery. If a failure is in an unrelated game or looks timing-sensitive, do not edit that game: keep the requested change and let the controller retry the unchanged candidate. If a broader repair is necessary, ask for owner review. Do not claim it is live. Failure:\n${String(error).slice(-6500)}`,text_elements:[]}],outputSchema:RESULT_SCHEMA}); }
-          catch { await this.codex.stop?.(); await this.disconnect(); }
+          catch {
+            await this.codex.stop?.();this.connected=false;
+            job.phase="interrupted";job.detail="The coding agent could not start the repair. Your edits are saved. Tap Retry to reconnect.";
+            this.active=undefined;this.pendingInput=undefined;this.approvals.clear();
+            await this.saveAndPaint(job);await this.pauseQueue();
+          }
           return;
         }
+        if(!cancelled && error instanceof CheckUnavailable) job.retryCheckpoint=candidate;
         job.phase=cancelled?"stopped":error instanceof ReviewRequired?"review":"interrupted";
-        job.detail=error instanceof ReviewRequired?error.message:cancelled?"Stopped. Any unfinished edits are saved.":"I couldn't complete a verified release. Your edits are saved. Ivan can inspect the release log, or you can Retry.";
+        job.detail=error instanceof ReviewRequired?error.message:cancelled?"Stopped. Any unfinished edits are saved.":error instanceof CheckUnavailable ? "Testing stopped because a check timed out or the test environment was unavailable. Your edits are saved; nothing was published. Tap Retry to try again." : "I couldn't complete a verified release. Your edits are saved. Ivan can inspect the release log, or you can Retry.";
         job.result=undefined; this.active=undefined;
         await this.saveAndPaint(job); await this.pauseQueue();
       })
-    ).finally(()=>{ this.releaseTask=undefined; });
+    ).finally(()=>{ this.releaseTask=undefined; void this.enqueue(()=>this.pump()); });
   }
 
   private async askQuestion(): Promise<void> {
@@ -367,6 +418,7 @@ export class FamilyConversation {
     const [verb, id] = action.id.split(":");
     const job = this.state.jobs.find((j) => j.id === id && j.message.channelId === action.channelId);
     if (!job) return "That request is no longer available.";
+    if(job.supersededBy)return "That draft was replaced by your follow-up. Use the latest request instead.";
     if (verb === "undo" && job.releaseId && this.releases) {
       if(this.active) return "Wait for the current request to finish before Undo.";
       this.active=job;job.undoing=true;await this.store.save(this.state);
@@ -381,6 +433,15 @@ export class FamilyConversation {
     if (verb === "stop") { await this.stopJob(job); return job.phase === "stopping" ? "Stopping now…" : "Stopped, or already finished."; }
     if (verb === "retry" && (job.phase === "interrupted" || (job.phase === "stopped" && !!job.sourceStart))) {
       if (this.active) return "Please wait for the current request, or stop it first.";
+      if(job.retryCheckpoint && this.releases?.checkpoint) {
+        const current=await this.releases.checkpoint();
+        if(current.tree!==job.retryCheckpoint.tree || current.baseline!==job.retryCheckpoint.baseline) {
+          job.phase="review";job.detail="The saved candidate changed since testing stopped. Ivan needs to review it before retrying.";
+          await this.saveAndPaint(job);return job.detail;
+        }
+        this.active=job;this.startRelease(job);await this.saveAndPaint(job);
+        return "Retrying the saved changes directly. No new coding step.";
+      }
       if (!this.connected) {
         try { await this.codex.stop?.(); await this.connect(); }
         catch { return "The coding agent is still unavailable. Your request is saved."; }
@@ -442,6 +503,14 @@ export class FamilyConversation {
     } catch { console.error("Status delivery failed; will retry"); }
   }
   private async deliver(job: Job): Promise<void> {
+    if(job.earlyReply){
+      const parts=chunkReply(job.earlyReply);
+      while((job.earlyDeliveredChunks ?? 0)<parts.length){
+        try {await this.discord.sendMessage(job.message.channelId,parts[job.earlyDeliveredChunks ?? 0]!);}
+        catch {return;}
+        job.earlyDeliveredChunks=(job.earlyDeliveredChunks ?? 0)+1;await this.store.save(this.state);
+      }
+    }
     if (!job.result || !["done", "waiting", "review"].includes(job.phase)) return;
     const chunks = chunkReply(job.result);
     while (job.deliveredChunks < chunks.length) {
@@ -466,7 +535,7 @@ export class FamilyConversation {
       catch { await this.codex.stop?.(); await this.disconnect(); }
       if (this.active) this.dirty.add(this.active.id);
     }
-    if(this.active && this.releaseTask) {this.active.activity=this.now(); this.dirty.add(this.active.id);}
+    if(this.active && this.releaseTask) {this.dirty.add(this.active.id);}
     for (const job of this.state.jobs) {
       if (this.dirty.has(job.id) && this.now() - (this.lastPaint.get(job.id) ?? 0) >= 3000) await this.paint(job);
       await this.deliver(job);

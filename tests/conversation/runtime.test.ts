@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { FamilyConversation, type ConversationCodex } from "../../src/conversation/runtime.js";
@@ -188,4 +188,256 @@ it('explicit Resume retains ownership of a stopped request',async()=>{
  await h.emit('turn/completed',{turn:{id:'t1',status:'interrupted'}});
  const resume=[...h.cards.values()][0]!.actions.find(a=>a.label==='Resume')!;
  await h.action({id:resume.id,userId:'wife',channelId:'game'});await h.complete('t2');await h.bot.settled();expect(calls).toBe(1);
+});
+
+it('does not spend a repair turn on unavailable test infrastructure',async()=>{
+ const {CheckUnavailable}=await import('../../src/releases/policy.js');
+ const service={recover:async()=>{},undo:async()=>"restored",release:async()=>{throw new CheckUnavailable('browser unavailable');}};
+ const h=await setup(service);await h.send();await h.complete();await new Promise(r=>setTimeout(r,10));await h.bot.settled();
+ expect(h.turns).toHaveLength(1);
+ expect([...h.cards.values()][0]!.content).toContain('test environment');
+ expect([...h.cards.values()][0]!.actions.some(a=>a.label==='Retry')).toBe(true);
+});
+
+it('retries identical infrastructure-blocked work without another coding turn',async()=>{
+ const {CheckUnavailable}=await import('../../src/releases/policy.js');
+ let calls=0,tree='base';
+ const service={recover:async()=>{},undo:async()=>"restored",checkpoint:async()=>({tree,baseline:'base'}),release:async()=>{
+  if(++calls===1)throw new CheckUnavailable('browser unavailable');return {published:true,message:'Verified live.'};
+ }};
+ const h=await setup(service);await h.send();tree='same';await h.complete();await new Promise(r=>setTimeout(r,10));await h.bot.settled();
+ const retry=[...h.cards.values()][0]!.actions.find(a=>a.label==='Retry')!;
+ await h.action({id:retry.id,userId:'wife',channelId:'game'});await new Promise(r=>setTimeout(r,10));await h.bot.settled();
+ expect(calls).toBe(2);expect(h.turns).toHaveLength(1);expect(h.replies).toEqual(['Verified live.']);
+});
+it('refuses an infrastructure retry if the candidate has changed',async()=>{
+ const {CheckUnavailable}=await import('../../src/releases/policy.js');
+ let tree='base',calls=0;
+ const service={recover:async()=>{},undo:async()=>"restored",checkpoint:async()=>({tree,baseline:'base'}),release:async()=>{calls++;throw new CheckUnavailable('browser unavailable');}};
+ const h=await setup(service);await h.send();tree='same';await h.complete();await new Promise(r=>setTimeout(r,10));await h.bot.settled();tree='changed';
+ const retry=[...h.cards.values()][0]!.actions.find(a=>a.label==='Retry')!;
+ await h.action({id:retry.id,userId:'wife',channelId:'game'});await h.bot.settled();
+ expect(calls).toBe(1);expect(h.turns).toHaveLength(1);expect([...h.cards.values()][0]!.content).toContain('saved candidate changed');
+});
+it('status refresh does not pretend a running check made progress',async()=>{
+ let finish!:(x:any)=>void;
+ const service={recover:async()=>{},undo:async()=>"restored",release:async(_id:string,update:any)=>{await update('checking','Testing game');return new Promise<any>(resolve=>{finish=resolve;});}};
+ const h=await setup(service);await h.send();await h.complete();await new Promise(r=>setTimeout(r,10));await h.bot.settled();
+ const before=[...h.cards.values()][0]!.content.match(/Last progress <t:\d+:R>/)![0];
+ h.advance();await h.bot.tick();await h.bot.settled();
+ expect([...h.cards.values()][0]!.content).toContain(before);
+ finish({published:false});await new Promise(r=>setTimeout(r,10));await h.bot.settled();
+});
+
+it('does not leave a phantom working job when repair startup fails after direct retry',async()=>{
+ const {CheckUnavailable,CheckFailed}=await import('../../src/releases/policy.js');
+ let calls=0,tree='base';
+ const service={recover:async()=>{},undo:async()=>"restored",checkpoint:async()=>({tree,baseline:'base'}),release:async()=>{
+  if(++calls===1)throw new CheckUnavailable('browser unavailable');throw new CheckFailed('gameplay assertion failed');
+ }};
+ const h=await setup(service);await h.send();tree='candidate';await h.complete();await new Promise(r=>setTimeout(r,10));await h.bot.settled();
+ h.disconnect();await h.bot.settled();h.setFailStart(true);
+ const retry=[...h.cards.values()][0]!.actions.find(a=>a.label==='Retry')!;
+ await h.action({id:retry.id,userId:'wife',channelId:'game'});await new Promise(r=>setTimeout(r,10));await h.bot.settled();
+ expect(calls).toBe(2);expect([...h.cards.values()][0]!.content).toContain('could not start the repair');
+ expect([...h.cards.values()][0]!.actions.some(a=>a.label==='Retry')).toBe(true);
+});
+
+
+describe("draft preview feedback", () => {
+  const preview = {id: "draft-1", url: "https://draft.example.test/potty/", tree: "candidate"};
+  const savedJobs = async (dir: string) => JSON.parse(await readFile(path.join(dir, "conversation.json"), "utf8")).jobs;
+
+  it("persists the draft link and keeps it visible through later checking updates", async () => {
+    let update!: (phase: "checking", detail: string, draft?: typeof preview) => Promise<void>;
+    let finish!: (result: {published: boolean}) => void;
+    const h = await setup({recover: async () => {}, undo: async () => "", release: async (_id, progress) => {
+      update = progress;
+      await update("checking", "Try the draft while broader checks run.", preview);
+      return new Promise(resolve => {finish = resolve;});
+    }});
+    try {
+      await h.send(); await h.complete();
+      await expect.poll(() => [...h.cards.values()][0]?.content).toContain(preview.url);
+      await update("checking", "Checking the other games.");
+      expect([...h.cards.values()][0]!.content).toContain(preview.url);
+      expect((await savedJobs(h.dir))[0].preview).toEqual(preview);
+    } finally {finish?.({published: false}); await h.bot.settled();}
+  });
+
+  it.each([false, true])("cancels obsolete checks and answers a question-only follow-up before publication (retry delivery: %s)", async failEarlyDelivery => {
+    let tree = "base", calls = 0;
+    let finishRevised!: (result: {published: boolean; message: string}) => void;
+    let signal!: AbortSignal;
+    let rejectOld!: (error: Error) => void;
+    let obsoleteUpdate!: (phase: "checking", detail: string) => Promise<void>;
+    const h = await setup({recover: async () => {}, undo: async () => "", checkpoint: async () => ({tree, baseline: "base"}),
+      release: async (_id, update, abort) => {
+        calls++;
+        if (calls > 1) return new Promise(resolve => {finishRevised = resolve;});
+        signal = abort!;
+        obsoleteUpdate = update;
+        await update("checking", "Draft is ready.", preview);
+        return new Promise((_resolve, reject) => {rejectOld = reject;});
+      }});
+    try {
+      await h.send("Make the character enter from the right."); tree = "candidate"; await h.complete();
+      await expect.poll(() => [...h.cards.values()][0]?.content).toContain(preview.url);
+      await h.send("How fast does the character walk?");
+      expect(signal.aborted).toBe(true);
+      expect(h.turns).toHaveLength(1); // Browser cleanup still owns the workspace.
+      expect(h.replies).toEqual([]);
+      const [old, next] = await savedJobs(h.dir);
+      expect(old.supersededBy).toBe(next.id);
+      expect(old.resolvedBy).toBe(next.id);
+      await obsoleteUpdate("checking", "Obsolete test progress.");
+      expect([...h.cards.values()][0]!.content).not.toContain("Obsolete test progress.");
+      expect(next.sourceStart).toEqual({tree: "base", baseline: "base"});
+      expect(next.message.content).toContain("Make the character enter from the right.");
+      expect(next.message.content).toContain("How fast does the character walk?");
+      // A late assertion failure from the old runner must not trigger a repair turn.
+      rejectOld(new Error("obsolete browser assertion failed after cancellation"));
+      await expect.poll(() => h.turns.length).toBe(2);
+      expect(JSON.stringify(h.turns[1])).toContain("How fast does the character walk?");
+      expect(JSON.stringify(h.turns[1])).not.toContain("obsolete browser assertion");
+      expect(calls).toBe(1);
+      // The answer adds no edits, but the inherited candidate remains authorized.
+      h.setFailReply(failEarlyDelivery);
+      await h.complete("t2");
+      await expect.poll(() => calls).toBe(2);
+      if (failEarlyDelivery) {
+        expect(h.replies).toEqual([]);
+        expect((await savedJobs(h.dir))[1].earlyReply).toBe("All done");
+        expect((await savedJobs(h.dir))[1].earlyDeliveredChunks).toBe(0);
+        h.setFailReply(false); h.advance(); await h.bot.tick(); await h.bot.settled();
+      }
+      // The parent gets their answer while the resumed release remains pending.
+      expect(h.replies).toEqual(["All done"]);
+      expect((await savedJobs(h.dir))[1].earlyDeliveredChunks).toBe(1);
+      h.advance(); await h.bot.tick(); await h.bot.settled();
+      expect(h.replies).toEqual(["All done"]);
+      finishRevised({published: true, message: "Revised draft verified live."});
+      await expect.poll(() => h.replies).toEqual(["All done", "Revised draft verified live."]);
+      expect(h.turns).toHaveLength(2);
+    } finally {
+      rejectOld?.(new Error("test cleanup"));
+      finishRevised?.({published: false, message: "test cleanup"});
+      await h.bot.settled();
+    }
+  });
+
+  it("replaces checks when a preview arrives after feedback was queued, and rejects controls on the old draft", async () => {
+    let tree = "base";
+    let signal!: AbortSignal;
+    let progress!: (phase: "checking", detail: string, draft?: typeof preview) => Promise<void>;
+    let rejectOld!: (error: Error) => void;
+    const h = await setup({recover: async () => {}, undo: async () => "", checkpoint: async () => ({tree, baseline: "base"}),
+      release: async (_id, update, abort) => {
+        signal = abort!; progress = update;
+        await update("checking", "Preparing the draft.");
+        return new Promise((_resolve, reject) => {rejectOld = reject;});
+      }});
+    try {
+      await h.send("Make the character enter from the right."); tree = "candidate"; await h.complete();
+      await expect.poll(() => typeof rejectOld).toBe("function");
+      await h.send("Make the walk slower too.");
+      expect(signal.aborted).toBe(false);
+      expect(h.turns).toHaveLength(1);
+      expect((await savedJobs(h.dir))[1].sourceStart).toBeUndefined();
+      await progress("checking", "Draft is ready.", preview);
+      expect(signal.aborted).toBe(true);
+      expect(h.turns).toHaveLength(1);
+      const [old, next] = await savedJobs(h.dir);
+      expect(old.supersededBy).toBe(next.id);
+      expect(old.resolvedBy).toBe(next.id);
+      expect(next.sourceStart).toEqual({tree: "base", baseline: "base"});
+      expect(next.message.content).toContain("Make the character enter from the right.");
+      expect(next.message.content).toContain("Make the walk slower too.");
+      expect([...h.cards.values()][0]!.actions).toEqual([]);
+      for (const verb of ["stop", "retry"]) {
+        expect(await h.action({id: `${verb}:${old.id}`, userId: "wife", channelId: "game"})).toContain("replaced");
+      }
+      expect(h.turns).toHaveLength(1);
+      rejectOld(new Error("cancelled after cleanup"));
+      await expect.poll(() => h.turns.length).toBe(2);
+      expect([...h.cards.values()][0]!.actions).toEqual([]);
+      expect((await savedJobs(h.dir))[1].sourceStart).toEqual({tree: "base", baseline: "base"});
+      expect(h.replies).toEqual([]);
+    } finally {rejectOld?.(new Error("test cleanup")); await h.bot.settled();}
+  });
+
+  it("retains draft authorization through a clarification question and the parent's answer", async () => {
+    let tree = "base", calls = 0;
+    let rejectOld!: (error: Error) => void;
+    const h = await setup({recover: async () => {}, undo: async () => "", checkpoint: async () => ({tree, baseline: "base"}),
+      release: async (_id, update) => {
+        if (++calls > 1) return {published: true, message: "Clarified draft verified live."};
+        await update("checking", "Draft is ready.", preview);
+        return new Promise((_resolve, reject) => {rejectOld = reject;});
+      }});
+    try {
+      await h.send("Make the character enter from the right."); tree = "candidate"; await h.complete();
+      await expect.poll(() => typeof rejectOld).toBe("function");
+      await h.send("Maybe change the walking speed?");
+      rejectOld(new Error("cancelled after cleanup"));
+      await expect.poll(() => h.turns.length).toBe(2);
+      await h.emit("item/completed", {turnId: "t2", item: {type: "agentMessage", phase: "final_answer",
+        text: JSON.stringify({message: "Should the character walk faster or slower?", state: "needs_reply"})}});
+      await h.emit("turn/completed", {turn: {id: "t2", status: "completed"}});
+      expect(calls).toBe(1);
+      expect(h.replies).toEqual(["Should the character walk faster or slower?"]);
+      expect((await savedJobs(h.dir))[1].phase).toBe("waiting");
+      await h.send("Keep the current speed, thanks.");
+      expect(h.turns).toHaveLength(3);
+      const [, discussion, answer] = await savedJobs(h.dir);
+      expect(discussion.resolvedBy).toBe(answer.id);
+      expect(answer.sourceStart).toEqual({tree: "base", baseline: "base"});
+      expect(answer.continuesDraft).toBe(true);
+      expect(JSON.stringify(h.turns[2])).toContain("Make the character enter from the right.");
+      expect(JSON.stringify(h.turns[2])).toContain("Keep the current speed, thanks.");
+      // No new edits are necessary; the original candidate is still authorized.
+      await h.complete("t3");
+      await expect.poll(() => h.replies).toEqual([
+        "Should the character walk faster or slower?", "All done", "Clarified draft verified live.",
+      ]);
+      expect(calls).toBe(2);
+      expect((await savedJobs(h.dir))[2].phase).toBe("done");
+      expect([...h.cards.values()][2]!.content).not.toContain("Ivan’s review");
+    } finally {rejectOld?.(new Error("test cleanup")); await h.bot.settled();}
+  });
+
+  it.each(["publishing", "verifying"] as const)("queues feedback without interrupting %s", async phase => {
+    let signal!: AbortSignal;
+    let finish!: (result: {published: boolean; message: string}) => void;
+    let tree = "base";
+    const h = await setup({recover: async () => {}, undo: async () => "", checkpoint: async () => ({tree, baseline: "base"}),
+      release: async (_id, update, abort) => {
+        signal = abort!;
+        await update("checking", "Draft ready.", preview);
+        await update(phase, "Finishing publication.");
+        return new Promise(resolve => {finish = resolve;});
+      }});
+    try {
+      await h.send(); tree = "candidate"; await h.complete();
+      await expect.poll(async () => (await savedJobs(h.dir))[0].phase).toBe(phase);
+      await h.send("Make it a little slower.");
+      expect(signal.aborted).toBe(false);
+      expect(h.turns).toHaveLength(1);
+      const [old, next] = await savedJobs(h.dir);
+      expect(old.supersededBy).toBeUndefined();
+      expect(next.phase).toBe("queued");
+      finish({published: true, message: "Verified live."});
+      await expect.poll(() => h.turns.length).toBe(2);
+      expect(h.replies).toEqual(["Verified live."]);
+    } finally {finish?.({published: false, message: "test cleanup"}); await h.bot.settled();}
+  });
+
+  it("answers an ordinary question without starting release checks when no edits exist", async () => {
+    let calls = 0;
+    const h = await setup({recover: async () => {}, undo: async () => "", checkpoint: async () => ({tree: "base", baseline: "base"}),
+      release: async () => {calls++; return {published: false};}});
+    await h.send("What games can my child play?"); await h.complete();
+    expect(calls).toBe(0);
+    expect(h.replies).toEqual(["All done"]);
+  });
 });

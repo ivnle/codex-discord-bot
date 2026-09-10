@@ -12,13 +12,15 @@ const titles = {
 export function taskCard(job: Job, now: number, connected: boolean): TaskCard {
   const age = Math.max(0, Math.floor((now - job.created) / 1000));
   const active = ["checking", "publishing", "verifying", "rolling_back"].includes(job.phase) || (["working", "stopping", "waiting"].includes(job.phase) && !job.result);
-  const freshness = active ? `\n${Math.floor(age / 60)}m ${age % 60}s elapsed · Last activity <t:${Math.floor(job.activity / 1000)}:R>\n${connected ? "Codex connected" : "Checking connection"}` : "";
+  const freshness = active ? `\n${Math.floor(age / 60)}m ${age % 60}s elapsed · Last progress <t:${Math.floor(job.activity / 1000)}:R>\n${["checking", "publishing", "verifying", "rolling_back"].includes(job.phase) ? "Automated checks · status refreshed" : connected ? "Codex connected" : "Checking connection"}` : "";
   const actions: TaskCard["actions"] = [];
   if (["received", "queued", "working", "waiting", "checking", "publishing", "verifying"].includes(job.phase)) actions.push({ id: `stop:${job.id}`, label: "Stop" });
   if (job.phase === "interrupted") actions.push({ id: `retry:${job.id}`, label: "Retry" });
   if (job.phase === "stopped" && job.sourceStart) actions.push({id:`retry:${job.id}`,label:"Resume"});
   if(job.releaseId && job.phase === "done") actions.push({id:`undo:${job.id}`,label:"Undo this change"});
-  return { content: `**${titles[job.phase]}**\n${job.detail.slice(0, 1100)}${freshness}`, actions };
+  const draft=job.preview ? `\n[Try this draft](${job.preview.url}) · ${job.phase==="done" ? "Earlier draft; use the live link above." : job.supersededBy ? "Superseded draft." : "Draft only—not the live game. Saves here are separate."}` : "";
+  if(job.supersededBy)actions.length=0;
+  return { content: `**${titles[job.phase]}**\n${job.detail.slice(0, 1100)}${draft}${freshness}`, actions };
 }
 
 export const FAMILY_INSTRUCTIONS = `You help a parent change a game for their child through Discord.
@@ -40,7 +42,7 @@ Never deploy, push, merge, change credentials, commit, or claim a change is live
 yourself. Finish with a concise description of the prepared change. The controller
 supplies the final publishing confirmation. For follow-up questions, use the trusted
 controller status supplied with the parent's message; earlier coding replies may
-predate publishing. There is no preview-deployment step for the parent to manage.
+predate publishing. The controller shares a draft link after quick checks, while full verification continues. Parents can try it and discuss or revise it in this channel. Draft saves are separate from the live game. Full checks still gate automatic production publishing. Never say a draft is live production.
 You can fix bugs, extend games, and create new games within src/games plus register
 them in src/app/games.ts. Keep existing games and routes. Existing tests, package and
 build settings, deployment files, service workers, platform code and saved-game storage

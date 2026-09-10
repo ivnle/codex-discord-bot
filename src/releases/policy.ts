@@ -12,3 +12,5 @@ export function riskyStorageDiff(diff: string): boolean {
 }
 export class ReviewRequired extends Error {}
 export class CheckFailed extends Error {}
+
+export class CheckUnavailable extends Error {}

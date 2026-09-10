@@ -4,10 +4,12 @@ import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, writeFile, rename, cp, rm, lstat, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
-import { protectedPath, riskyStorageDiff, ReviewRequired, CheckFailed } from "./policy.js";
+import { protectedPath, riskyStorageDiff, ReviewRequired, CheckFailed, CheckUnavailable } from "./policy.js";
 
 export interface ReleaseConfig { cwd: string; dir: string; account: string; project: string; origin: string; wrangler: string; credentials: string; baselineCommit: string; baselineDeployment: string; browserCache: string; branch?: string; }
 export type ReleasePhase = "checking" | "publishing" | "verifying" | "rolling_back";
+export interface DraftPreview { id:string; url:string; tree:string; }
+export type ReleaseUpdate = (phase: ReleasePhase, detail: string, preview?: DraftPreview) => Promise<void>;
 export interface ReleaseOutcome { published: boolean; id?: string; message?: string; }
 export interface ReleaseService {
   recover(): Promise<void>;
@@ -16,7 +18,7 @@ export interface ReleaseService {
   hasChanges?(): Promise<boolean>;
   checkpoint?(): Promise<{tree:string; baseline:string}>;
   repairContext?(jobId:string): Promise<string>;
-  release(jobId: string, update: (phase: ReleasePhase, detail: string) => Promise<void>, signal: AbortSignal): Promise<ReleaseOutcome>;
+  release(jobId: string, update: ReleaseUpdate, signal: AbortSignal): Promise<ReleaseOutcome>;
   undo(id: string, update: (phase: ReleasePhase, detail: string) => Promise<void>): Promise<string>;
 }
 type Version = { commit: string; deployment: string; release?: string };
@@ -26,7 +28,7 @@ const cleanEnv = (): NodeJS.ProcessEnv => Object.fromEntries(["HOME", "PATH", "U
 
 export async function command(command: string, args: string[], cwd: string, options: { signal?: AbortSignal; env?: NodeJS.ProcessEnv; log?: string; timeout?: number; onOutput?: (text:string)=>void } = {}): Promise<string> {
   return new Promise((resolve, reject) => {
-    let output = ""; let overflow=false;
+    let output = ""; let overflow=false; let timedOut=false;
     const child = spawn(command, args, { cwd, env: options.env ?? cleanEnv(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
     const kill = () => {
       // Gameplay runners create detached groups. Stop descendants before their
@@ -40,7 +42,7 @@ export async function command(command: string, args: string[], cwd: string, opti
       for(const pid of descendants.reverse()) {try{process.kill(-pid,"SIGKILL");}catch{} try{process.kill(pid,"SIGKILL");}catch{}}
       try { process.kill(-child.pid!, "SIGKILL"); } catch {}
     };
-    const timer = setTimeout(kill, options.timeout ?? 25 * 60_000);
+    const timer = setTimeout(() => { timedOut=true; kill(); }, options.timeout ?? 25 * 60_000);
     options.signal?.addEventListener("abort", kill, { once: true });
     if (options.signal?.aborted) kill();
     const log = options.log ? createWriteStream(options.log,{mode:0o600}) : undefined;
@@ -53,8 +55,8 @@ export async function command(command: string, args: string[], cwd: string, opti
       // Never leave a detached test server alive after a command exits.
       kill();
       if(log) await new Promise<void>(r=>log.end(r));
-      if (code === 0 && !options.signal?.aborted && !overflow) resolve(output.trim());
-      else reject(new CheckFailed(options.signal?.aborted ? "Stopped before publishing." : `${path.basename(command)} failed (${code}).\n${output.slice(-6500)}`));
+      if (code === 0 && !options.signal?.aborted && !overflow && !timedOut) resolve(output.trim());
+      else reject(new (output.includes("GENGAR_CHECK_REVIEW") ? ReviewRequired : timedOut || output.includes("GENGAR_CHECK_UNAVAILABLE") ? CheckUnavailable : CheckFailed)(options.signal?.aborted ? "Stopped before publishing." : `${timedOut ? "Time limit exceeded: " : ""}${path.basename(command)} failed (${code}).\n${output.slice(-6500)}`));
     });
   });
 }
@@ -93,6 +95,14 @@ export class ReleaseController implements ReleaseService {
     if (!body.success) throw new Error("Cloudflare did not accept the release operation.");
     return body.result;
   }
+  private async deployments():Promise<any[]> {
+    const result:any[]=[];
+    for(let page=1;page<=4;page++){
+      const rows=await this.api(`/deployments?per_page=25&page=${page}`);
+      result.push(...rows);if(rows.length<25)break;
+    }
+    return result;
+  }
   private async refresh() { await command(this.config.wrangler, ["whoami"], this.config.dir, { timeout: 60000, log: path.join(this.config.dir, "cloudflare-login.log") }); }
   private async current(): Promise<string> { return (await this.api()).canonical_deployment.id; }
   async recover(): Promise<void> {
@@ -107,7 +117,7 @@ export class ReleaseController implements ReleaseService {
     await this.refresh();
     const pending = j.pending;
     // An interrupted upload is ambiguous. Identify it by our unique commit message.
-    const deployments = await this.api("/deployments?per_page=100");
+    const deployments = await this.deployments();
     const matching = deployments.filter((d: any) => d.deployment_trigger?.metadata?.commit_message === `gengar:${pending.id}`);
     if (matching.some((d: any) => !["success", "failure", "canceled"].includes(d.latest_stage?.status))) throw new Error("A prior upload is still settling. Recovery will retry before accepting changes.");
     const current = await this.current();
@@ -199,7 +209,7 @@ export class ReleaseController implements ReleaseService {
       return `The controller only permits repairs in these originally changed files: ${scope.files.join(", ")}. Expanding to another file requires owner review.`;
     }catch(e){if((e as NodeJS.ErrnoException).code!=="ENOENT")throw e;return "Preserve the original request's scope.";}
   }
-  async release(jobId: string, update: (p: ReleasePhase, d: string) => Promise<void>, signal: AbortSignal): Promise<ReleaseOutcome> {
+  async release(jobId: string, update: ReleaseUpdate, signal: AbortSignal): Promise<ReleaseOutcome> {
     await this.acquire();
     if (this.busy) throw new Error("A release is already running.");
     this.busy = true;
@@ -222,11 +232,23 @@ export class ReleaseController implements ReleaseService {
       // Copy installed dependencies; the agent cannot write the trusted installation.
       await command("/bin/cp", ["-cR", path.join(this.config.cwd, "node_modules"), path.join(source, "node_modules")], root);
       const profile = await this.buildProfile(source, root);
-      await command("/usr/bin/sandbox-exec", ["-f", profile, "/opt/homebrew/bin/npm", "run", "verify"], source, {signal, log:path.join(root,"checks.log"),onOutput:text=>{
-        const match=/\[(\d+)\/(\d+)\] ([^\n]+) —/.exec(text);
-        if(match) void update("checking",`Checking game ${match[1]} of ${match[2]}: ${match[3]}. The live game is unchanged until all checks pass.`).catch(()=>{});
-      }});
-      await command("/usr/bin/sandbox-exec", ["-f", profile, "/opt/homebrew/bin/node", fileURLToPath(new URL("../../scripts/release-scenarios.mjs",import.meta.url)), source], source, {signal, log:path.join(root,"scenarios.log")});
+      const changed = (await this.git(["diff", "--no-renames", "--name-only", j.current.commit, tree])).split("\n");
+      const runChecks=async(phase:"quick"|"full")=>{
+        let pendingOutput = "";
+        await command("/usr/bin/sandbox-exec", ["-f", profile, "/opt/homebrew/bin/node", fileURLToPath(new URL("../../scripts/release-checks.mjs",import.meta.url)), source, JSON.stringify(changed), phase], source, {
+          signal, log:path.join(root,`${phase}-checks.log`), timeout:phase==="quick"?10*60_000:35*60_000,
+          onOutput:text=>{
+            pendingOutput += text;
+            const lines=pendingOutput.split("\n"); pendingOutput=lines.pop() ?? "";
+            for(const line of lines) if(line.startsWith("GENGAR_PROGRESS ")) {
+              try { const event=JSON.parse(line.slice(16)) as {detail:string};
+                if(typeof event.detail === "string") void update("checking",event.detail).catch(()=>{});
+              } catch {}
+            }
+          }
+        });
+      };
+      await runChecks("quick");
       if (signal.aborted) throw new CheckFailed("Stopped before publishing.");
       await this.assertSourceHead(j.current.commit);
       if (tree !== await this.snapshot()) throw new ReviewRequired("Files changed during checking. Nothing was published; retry to check the latest work.");
@@ -238,13 +260,33 @@ export class ReleaseController implements ReleaseService {
       if (await exists(path.join(stage,"_worker.js"))) throw new ReviewRequired("Worker deployments need Ivan's review.");
       const hashes = await artifactHashes(stage);
       await writeFile(path.join(stage,"release.json"), JSON.stringify({id,commit,hashes}));
+      await update("checking","Quick checks passed. Preparing a draft you can try while the full checks run.");
+      let preview:DraftPreview;
+      try {preview=await this.publishPreview(stage,root,id,commit,tree,j.current.deployment,signal);}
+      catch(error) {
+        if(signal.aborted || error instanceof ReviewRequired)throw error;
+        throw new CheckUnavailable(`Draft hosting is unavailable. Your edits are saved. ${error instanceof Error ? error.message : String(error)}`);
+      }
+      await update("checking","Draft ready. Try it below; reply here to discuss or revise it. Full checks must pass before it goes live.",preview);
+      await runChecks("full");
+      if(signal.aborted)throw new CheckFailed("Stopped before publishing.");
+      // The full checks must exercise exactly the game bytes uploaded as draft.
+      const checkedHashes=await artifactHashes(path.join(source,"dist"));
+      delete checkedHashes["_routes.json"];
+      if(Object.keys(checkedHashes).length!==Object.keys(hashes).length || Object.entries(hashes).some(([file,hash])=>checkedHashes[file]!==hash))throw new ReviewRequired("Built game files changed during testing. A new draft must be checked before publishing.");
+      await this.assertSourceHead(j.current.commit);
+      if(tree!==await this.snapshot())throw new ReviewRequired("Files changed during checking. Nothing was published; retry to check the latest work.");
       await this.refresh();
       if (await this.current() !== j.current.deployment) throw new ReviewRequired("The live game changed outside Gengar. Ivan needs to reconcile it before publishing.");
       const project = await this.api();
+      if(signal.aborted)throw new CheckFailed("Stopped before publishing.");
       j.pending = { id, commit, previous: {...j.current}, phase:"publishing" }; await this.save(j);
+      let uploadStarted=false;
       try {
         await update("publishing", "Checks passed. Putting this version on the usual game link.");
+        if(signal.aborted)throw new CheckFailed("Stopped before publishing.");
         // Once upload starts, finish verification or rollback even if Stop is pressed.
+        uploadStarted=true;
         await command(this.config.wrangler, ["pages","deploy",stage,"--project-name",this.config.project,"--branch",project.production_branch,"--commit-hash",commit,"--commit-message",`gengar:${id}`,"--commit-dirty=false"], root, {log:path.join(root,"upload.log"),timeout:180000});
         const deployment = await this.api();
         if (deployment.canonical_deployment.deployment_trigger?.metadata?.commit_message !== `gengar:${id}`) throw new Error("The uploaded version isn't the active production version.");
@@ -259,24 +301,44 @@ export class ReleaseController implements ReleaseService {
         j.current = {commit, deployment:j.pending.deployment!, release:id}; j.latest=j.pending; delete j.pending; await this.save(j);
         return {published:true,id,message:`It's live! [Open the game](${this.config.origin}). Refresh or close and reopen the app to see the update. You can use Undo if you'd like the previous version back.`};
       } catch (e) {
+        if(!uploadStarted){delete j.pending;await this.save(j);throw e;}
         await update("rolling_back", "The release didn't finish cleanly. Checking and restoring the previous live version.");
         await this.recover();
         throw new CheckFailed(`Release wasn't completed. Previous live version restored; your edits are saved. ${e instanceof Error ? e.message : ""}`);
       }
     } finally { this.busy=false; }
   }
-  private async verifyLive(id: string, hashes: Record<string,string>) {
+  async publishPreview(stage:string,root:string,id:string,commit:string,tree:string,production:string,signal:AbortSignal):Promise<DraftPreview> {
+    await this.refresh();
+    const project=await this.api();
+    const branch="gengar-preview";
+    if(project.production_branch===branch)throw new ReviewRequired("The draft branch matches production; preview setup needs review.");
+    if(project.canonical_deployment.id!==production)throw new ReviewRequired("Production changed before the draft upload.");
+    if(signal.aborted)throw new CheckFailed("Stopped before uploading a draft.");
+    await command(this.config.wrangler,["pages","deploy",stage,"--project-name",this.config.project,"--branch",branch,"--commit-hash",commit,"--commit-message",`gengar-preview:${id}`,"--commit-dirty=false"],root,{signal,log:path.join(root,"preview-upload.log"),timeout:180000});
+    const deployments=await this.deployments();
+    const deployment=deployments.find((d:any)=>d.environment==="preview" && d.deployment_trigger?.metadata?.commit_message===`gengar-preview:${id}`);
+    if(!deployment || deployment.latest_stage?.status!=="success")throw new CheckUnavailable("The draft upload could not be confirmed. Production is unchanged.");
+    const url=new URL(deployment.url);
+    if(typeof project.subdomain!=="string" || !/^[a-z0-9-]+\.pages\.dev$/.test(project.subdomain) || url.protocol!=="https:" || url.username || url.password || url.port || !url.hostname.endsWith(`.${project.subdomain}`))throw new ReviewRequired("Unexpected draft URL; refusing to share it.");
+    try {await this.verifyLive(id,await artifactHashes(stage),url.origin,signal);}
+    catch {throw new CheckUnavailable("The uploaded draft could not be verified. Production is unchanged.");}
+    if(await this.current()!==production)throw new ReviewRequired("Production changed during the draft upload.");
+    return {id,url:url.origin,tree};
+  }
+  private async verifyLive(id: string, hashes: Record<string,string>, origin=this.config.origin, signal?:AbortSignal) {
     let error: unknown;
     for (let attempt=0;attempt<12;attempt++) {
+      if(signal?.aborted)throw new CheckFailed("Stopped while checking draft availability.");
       try {
-        const r=await fetch(`${this.config.origin}/release.json?check=${randomUUID()}`,{headers:{"Cache-Control":"no-cache"},signal:AbortSignal.timeout(15000)});
+        const r=await fetch(`${origin}/release.json?check=${randomUUID()}`,{headers:{"Cache-Control":"no-cache"},signal:signal ? AbortSignal.any([signal,AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000)});
         if (!r.ok || (await r.json() as {id:string}).id!==id) throw new Error("Live version hasn't updated yet.");
         for (const file of ["index.html","sw.js"]) {
-          const asset=await fetch(`${this.config.origin}/${file}?check=${randomUUID()}`,{headers:{"Cache-Control":"no-cache"},signal:AbortSignal.timeout(15000)});
+          const asset=await fetch(`${origin}/${file}?check=${randomUUID()}`,{headers:{"Cache-Control":"no-cache"},signal:signal ? AbortSignal.any([signal,AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000)});
           if (!asset.ok || digest(Buffer.from(await asset.arrayBuffer())) !== hashes[file]) throw new Error(`Live ${file} does not match the checked build.`);
         }
         return;
-      } catch(e) { error=e; await new Promise(r=>setTimeout(r,5000)); }
+      } catch(e) { if(signal?.aborted)throw e; error=e; await new Promise(r=>setTimeout(r,5000)); }
     }
     throw error;
   }
